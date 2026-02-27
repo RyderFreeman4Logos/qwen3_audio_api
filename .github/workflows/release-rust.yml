@@ -24,7 +24,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg cmake
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg cmake \
+            libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev libclang-dev pkg-config
 
       - name: Cache libtorch
         id: cache-libtorch
