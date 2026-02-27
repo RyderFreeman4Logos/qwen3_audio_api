@@ -10,11 +10,11 @@ OpenAI-compatible API servers for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TT
 | Language | Directory | Status |
 |----------|-----------|--------|
 | Python | [python/](python/) | Available |
-| Rust | `rust/` (planned) | Coming soon |
+| Rust | [rust/](rust/) | Available |
 
 The **Python** implementation is a FastAPI server built on the `qwen-tts` and `qwen-asr` Python packages. See [python/README.md](python/README.md) for setup, Docker images, API reference, and usage examples.
 
-The **Rust** implementation will be built on the [qwen3_tts](https://crates.io/crates/qwen3_tts) Rust crate. Stay tuned.
+The **Rust** implementation is a high-performance axum/tokio server built on the [qwen3_tts](https://github.com/second-state/qwen3_tts_rs) and [qwen3_asr](https://github.com/second-state/qwen3_asr_rs) Rust crates, with libtorch (Linux) and MLX (macOS Apple Silicon) backends. See [rust/README.md](rust/README.md) for setup, pre-built binaries, API reference, and usage examples.
 
 ## Features
 
