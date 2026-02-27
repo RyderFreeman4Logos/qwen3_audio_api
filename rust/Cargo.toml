@@ -1,0 +1,46 @@
+[package]
+name = "qwen3-audio-api"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible audio API server using Qwen3 TTS/ASR (Rust)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "qwen3-audio-api"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Audio processing
+hound = "3.5"
+
+# Encoding
+base64 = "0.22"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Temporary files
+tempfile = "3"
+
+# Qwen3 inference crates (git dependencies)
+qwen3_tts = { git = "https://github.com/second-state/qwen3_tts_rs.git", default-features = false }
+qwen3_asr = { git = "https://github.com/second-state/qwen3_asr_rs.git", default-features = false }
+
+[features]
+default = ["tch-backend"]
+tch-backend = ["qwen3_tts/tch-backend", "qwen3_asr/tch-backend"]
+mlx = ["qwen3_tts/mlx", "qwen3_asr/mlx"]

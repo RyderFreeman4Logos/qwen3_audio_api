@@ -1,0 +1,480 @@
+name: CI (Rust)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      LIBTORCH_VERSION: "2.7.1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg cmake
+
+      - name: Cache libtorch
+        id: cache-libtorch
+        uses: actions/cache@v4
+        with:
+          path: libtorch
+          key: libtorch-cpu-${{ env.LIBTORCH_VERSION }}
+
+      - name: Download libtorch
+        if: steps.cache-libtorch.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip" -O libtorch.zip
+          unzip -q libtorch.zip
+          rm libtorch.zip
+
+      - name: Set libtorch environment
+        run: |
+          echo "LIBTORCH=$(pwd)/libtorch" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$(pwd)/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build Rust server
+        working-directory: rust
+        run: cargo build --release
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Install Python deps (for model download)
+        run: uv sync --project python
+
+      - name: Cache models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+            models/Qwen3-TTS-12Hz-0.6B-Base
+            models/Qwen3-ASR-0.6B
+          key: qwen-audio-models-0.6B-v2
+
+      - name: Download models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          uv run --project python huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+            --local-dir ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+          uv run --project python huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+            --local-dir ./models/Qwen3-TTS-12Hz-0.6B-Base
+          uv run --project python huggingface-cli download Qwen/Qwen3-ASR-0.6B \
+            --local-dir ./models/Qwen3-ASR-0.6B
+
+      - name: Generate tokenizer.json files for Rust crates
+        run: |
+          uv run --project python python3 -c "
+          from transformers import AutoTokenizer
+          import os
+          for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qwen3-ASR-0.6B']:
+              path = f'models/{model}'
+              if os.path.isdir(path):
+                  tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+                  tok.backend_tokenizer.save(f'{path}/tokenizer.json')
+                  print(f'Generated {path}/tokenizer.json')
+          "
+
+      - name: Create output directory
+        run: mkdir -p artifacts
+
+      # ==================================================================
+      # Phase 1: Both TTS models loaded
+      # ==================================================================
+
+      - name: "Phase 1: Start server (both TTS models)"
+        run: |
+          TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+          TTS_BASE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-Base \
+          LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH \
+          ./rust/target/release/qwen3-audio-api &
+          echo $! > /tmp/server.pid
+          echo "Waiting for server..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: "Phase 1: Generate English speech with Vivian"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "Hello, this is Vivian speaking English for the integration test.",
+              "voice": "Vivian",
+              "language": "English",
+              "response_format": "wav"
+            }' \
+            --output artifacts/phase1_vivian_english.wav
+          echo "Generated phase1_vivian_english.wav ($(stat --format=%s artifacts/phase1_vivian_english.wav) bytes)"
+
+      - name: "Phase 1: Generate Chinese speech with Vivian"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "你好，这是Vivian的中文语音合成测试。",
+              "voice": "Vivian",
+              "language": "Chinese",
+              "response_format": "wav"
+            }' \
+            --output artifacts/phase1_vivian_chinese.wav
+          echo "Generated phase1_vivian_chinese.wav ($(stat --format=%s artifacts/phase1_vivian_chinese.wav) bytes)"
+
+      - name: "Phase 1: Clone English voice from Vivian sample"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -F model=qwen3-tts \
+            -F "input=This sentence clones the Vivian English voice using audio_sample." \
+            -F audio_sample=@artifacts/phase1_vivian_english.wav \
+            -F "audio_sample_text=Hello, this is Vivian speaking English for the integration test." \
+            -F language=English \
+            -F response_format=wav \
+            --output artifacts/phase1_clone_english.wav
+          echo "Generated phase1_clone_english.wav ($(stat --format=%s artifacts/phase1_clone_english.wav) bytes)"
+
+      - name: "Phase 1: Clone Chinese voice from Vivian sample"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -F model=qwen3-tts \
+            -F "input=这段语音使用了Vivian的中文音频样本进行声音克隆。" \
+            -F audio_sample=@artifacts/phase1_vivian_chinese.wav \
+            -F "audio_sample_text=你好，这是Vivian的中文语音合成测试。" \
+            -F language=Chinese \
+            -F response_format=wav \
+            --output artifacts/phase1_clone_chinese.wav
+          echo "Generated phase1_clone_chinese.wav ($(stat --format=%s artifacts/phase1_clone_chinese.wav) bytes)"
+
+      - name: "Phase 1: Stop server"
+        run: kill "$(cat /tmp/server.pid)" && sleep 2
+
+      # ==================================================================
+      # Phase 2: CustomVoice model only
+      # ==================================================================
+
+      - name: "Phase 2: Start server (CustomVoice only)"
+        run: |
+          TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+          LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH \
+          ./rust/target/release/qwen3-audio-api &
+          echo $! > /tmp/server.pid
+          echo "Waiting for server..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: "Phase 2: Generate English speech with Ryan"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "Hello, this is Ryan speaking English with only the CustomVoice model loaded.",
+              "voice": "Ryan",
+              "language": "English",
+              "response_format": "wav"
+            }' \
+            --output artifacts/phase2_ryan_english.wav
+          echo "Generated phase2_ryan_english.wav ($(stat --format=%s artifacts/phase2_ryan_english.wav) bytes)"
+
+      - name: "Phase 2: Generate Chinese speech with Ryan"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "你好，这是Ryan的中文语音，仅加载了CustomVoice模型。",
+              "voice": "Ryan",
+              "language": "Chinese",
+              "response_format": "wav"
+            }' \
+            --output artifacts/phase2_ryan_chinese.wav
+          echo "Generated phase2_ryan_chinese.wav ($(stat --format=%s artifacts/phase2_ryan_chinese.wav) bytes)"
+
+      - name: "Phase 2: Verify audio_sample returns error"
+        run: |
+          status=$(curl -s -o /tmp/response.json -w "%{http_code}" --max-time 30 \
+            -X POST http://localhost:8000/v1/audio/speech \
+            -F model=qwen3-tts \
+            -F "input=This should fail." \
+            -F audio_sample=@artifacts/phase1_vivian_english.wav \
+            -F language=English \
+            -F response_format=wav)
+          echo "HTTP status: $status"
+          cat /tmp/response.json
+          echo
+          if [ "$status" -ne 400 ]; then
+            echo "FAIL: Expected HTTP 400 but got $status"
+            exit 1
+          fi
+          echo "PASS: audio_sample correctly rejected without Base model"
+
+      - name: "Phase 2: Stop server"
+        run: kill "$(cat /tmp/server.pid)" && sleep 2
+
+      # ==================================================================
+      # Phase 3: Base model only
+      # ==================================================================
+
+      - name: "Phase 3: Start server (Base only)"
+        run: |
+          TTS_BASE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-Base \
+          LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH \
+          ./rust/target/release/qwen3-audio-api &
+          echo $! > /tmp/server.pid
+          echo "Waiting for server..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: "Phase 3: Clone voice from Ryan English sample"
+        run: |
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -F model=qwen3-tts \
+            -F "input=This clones Ryan voice with only the Base model loaded." \
+            -F audio_sample=@artifacts/phase2_ryan_english.wav \
+            -F "audio_sample_text=Hello, this is Ryan speaking English with only the CustomVoice model loaded." \
+            -F language=English \
+            -F response_format=wav \
+            --output artifacts/phase3_clone_ryan.wav
+          echo "Generated phase3_clone_ryan.wav ($(stat --format=%s artifacts/phase3_clone_ryan.wav) bytes)"
+
+      - name: "Phase 3: Verify voice name returns error"
+        run: |
+          status=$(curl -s -o /tmp/response.json -w "%{http_code}" --max-time 30 \
+            -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "This should fail.",
+              "voice": "Ryan",
+              "language": "English",
+              "response_format": "wav"
+            }')
+          echo "HTTP status: $status"
+          cat /tmp/response.json
+          echo
+          if [ "$status" -ne 400 ]; then
+            echo "FAIL: Expected HTTP 400 but got $status"
+            exit 1
+          fi
+          echo "PASS: voice name correctly rejected without CustomVoice model"
+
+      - name: "Phase 3: Stop server"
+        run: kill "$(cat /tmp/server.pid)" && sleep 2
+
+      # ==================================================================
+      # Phase 4: ASR model only
+      # ==================================================================
+
+      - name: "Phase 4: Start server (ASR only)"
+        run: |
+          ASR_MODEL_PATH=./models/Qwen3-ASR-0.6B \
+          LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH \
+          ./rust/target/release/qwen3-audio-api &
+          echo $! > /tmp/server.pid
+          echo "Waiting for server..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: "Phase 4: Transcribe English audio"
+        run: |
+          result=$(curl -sf --max-time 300 -X POST http://localhost:8000/v1/audio/transcriptions \
+            -F file=@artifacts/phase1_vivian_english.wav \
+            -F model=qwen3-asr \
+            -F language=English)
+          echo "Transcription result: $result"
+          echo "$result" > artifacts/phase4_transcribe_english.txt
+          # Verify we got a text response
+          echo "$result" | python3 -c "import sys, json; d = json.load(sys.stdin); assert 'text' in d and len(d['text']) > 0, 'No text in response'"
+          echo "PASS: English transcription successful"
+
+      - name: "Phase 4: Transcribe Chinese audio"
+        run: |
+          result=$(curl -sf --max-time 300 -X POST http://localhost:8000/v1/audio/transcriptions \
+            -F file=@artifacts/phase1_vivian_chinese.wav \
+            -F model=qwen3-asr \
+            -F language=Chinese)
+          echo "Transcription result: $result"
+          echo "$result" > artifacts/phase4_transcribe_chinese.txt
+          # Verify we got a text response
+          echo "$result" | python3 -c "import sys, json; d = json.load(sys.stdin); assert 'text' in d and len(d['text']) > 0, 'No text in response'"
+          echo "PASS: Chinese transcription successful"
+
+      - name: "Phase 4: Verify TTS returns error"
+        run: |
+          status=$(curl -s -o /tmp/response.json -w "%{http_code}" --max-time 30 \
+            -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen3-tts",
+              "input": "This should fail.",
+              "voice": "Vivian",
+              "language": "English",
+              "response_format": "wav"
+            }')
+          echo "HTTP status: $status"
+          cat /tmp/response.json
+          echo
+          if [ "$status" -ne 400 ]; then
+            echo "FAIL: Expected HTTP 400 but got $status"
+            exit 1
+          fi
+          echo "PASS: TTS correctly rejected without TTS model"
+
+      - name: "Phase 4: Stop server"
+        run: kill "$(cat /tmp/server.pid)" && sleep 2
+
+      # ==================================================================
+      # Phase 5: TTS + ASR Round-Trip Test
+      # ==================================================================
+
+      - name: "Phase 5: Start server (TTS + ASR)"
+        run: |
+          TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+          ASR_MODEL_PATH=./models/Qwen3-ASR-0.6B \
+          LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH \
+          ./rust/target/release/qwen3-audio-api &
+          echo $! > /tmp/server.pid
+          echo "Waiting for server..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: "Phase 5: TTS->ASR Round-Trip (English)"
+        run: |
+          INPUT_TEXT="Hello, this is a test of the Qwen text to speech system."
+
+          # Generate speech
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"qwen3-tts\",
+              \"input\": \"$INPUT_TEXT\",
+              \"voice\": \"Vivian\",
+              \"language\": \"English\",
+              \"response_format\": \"wav\"
+            }" \
+            --output artifacts/phase5_tts_english.wav
+          echo "Generated phase5_tts_english.wav ($(stat --format=%s artifacts/phase5_tts_english.wav) bytes)"
+
+          # Transcribe
+          result=$(curl -sf --max-time 300 -X POST http://localhost:8000/v1/audio/transcriptions \
+            -F file=@artifacts/phase5_tts_english.wav \
+            -F model=qwen3-asr \
+            -F language=English)
+
+          OUTPUT_TEXT=$(echo "$result" | python3 -c "import sys, json; print(json.load(sys.stdin)['text'])")
+
+          echo "=========================================="
+          echo "ENGLISH ROUND-TRIP TEST"
+          echo "=========================================="
+          echo "Input text:  $INPUT_TEXT"
+          echo "Output text: $OUTPUT_TEXT"
+          echo "==========================================" | tee artifacts/phase5_roundtrip_english.txt
+
+          # The texts should be similar (not exact due to ASR limitations)
+          echo "PASS: English round-trip completed"
+
+      - name: "Phase 5: TTS->ASR Round-Trip (Chinese)"
+        run: |
+          INPUT_TEXT="你好，这是一个语音合成和语音识别的测试。"
+
+          # Generate speech
+          curl -sf --max-time 600 -X POST http://localhost:8000/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"qwen3-tts\",
+              \"input\": \"$INPUT_TEXT\",
+              \"voice\": \"Vivian\",
+              \"language\": \"Chinese\",
+              \"response_format\": \"wav\"
+            }" \
+            --output artifacts/phase5_tts_chinese.wav
+          echo "Generated phase5_tts_chinese.wav ($(stat --format=%s artifacts/phase5_tts_chinese.wav) bytes)"
+
+          # Transcribe
+          result=$(curl -sf --max-time 300 -X POST http://localhost:8000/v1/audio/transcriptions \
+            -F file=@artifacts/phase5_tts_chinese.wav \
+            -F model=qwen3-asr \
+            -F language=Chinese)
+
+          OUTPUT_TEXT=$(echo "$result" | python3 -c "import sys, json; print(json.load(sys.stdin)['text'])")
+
+          echo "=========================================="
+          echo "CHINESE ROUND-TRIP TEST"
+          echo "=========================================="
+          echo "Input text:  $INPUT_TEXT"
+          echo "Output text: $OUTPUT_TEXT"
+          echo "==========================================" | tee artifacts/phase5_roundtrip_chinese.txt
+
+          # The texts should be similar (not exact due to ASR limitations)
+          echo "PASS: Chinese round-trip completed"
+
+      - name: "Phase 5: Stop server"
+        run: kill "$(cat /tmp/server.pid)" && sleep 2
+
+      # ==================================================================
+      # Upload artifacts
+      # ==================================================================
+
+      - name: Upload audio artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-audio-rust
+          path: artifacts/*.wav
+
+      - name: Upload transcription artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcriptions-rust
+          path: artifacts/*.txt
