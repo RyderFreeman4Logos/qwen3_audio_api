@@ -7,6 +7,8 @@ A high-performance Rust server that wraps [Qwen3-TTS](https://github.com/QwenLM/
 - **libtorch** (Linux) — PyTorch C++ runtime, CPU or CUDA GPU
 - **MLX** (macOS Apple Silicon) — Apple Metal GPU acceleration
 
+The release binaries statically link ffmpeg libraries — no system ffmpeg shared libraries are needed. Only the `ffmpeg` CLI binary is required at runtime for audio format conversion (MP3, Opus, AAC, FLAC output and non-WAV input to ASR).
+
 ## Quick start with pre-built binaries
 
 Pre-built binaries are available from [GitHub Releases](https://github.com/second-state/qwen3_audio_api/releases).
@@ -19,14 +21,19 @@ curl -LO https://github.com/second-state/qwen3_audio_api/releases/latest/downloa
 tar xzf qwen3-audio-api-linux-x86_64.tar.gz
 cd qwen3-audio-api-linux-x86_64
 
-# Install ffmpeg (required for audio format conversion)
+# Install ffmpeg CLI (needed at runtime for audio format conversion)
 sudo apt-get install -y ffmpeg
 
 # Set libtorch library path (bundled in the archive)
 export LD_LIBRARY_PATH=$(pwd)/libtorch/lib:$LD_LIBRARY_PATH
 
-# Run the server (see "Download models" below first)
-TTS_CUSTOMVOICE_MODEL_PATH=/path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+# Download models (see "Download models" section below)
+# ...
+
+# Run the server with TTS + ASR
+TTS_CUSTOMVOICE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  TTS_BASE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-Base \
+  ASR_MODEL_PATH=/path/to/models/Qwen3-ASR-0.6B \
   ./qwen3-audio-api
 ```
 
@@ -38,12 +45,17 @@ curl -LO https://github.com/second-state/qwen3_audio_api/releases/latest/downloa
 tar xzf qwen3-audio-api-macos-arm64.tar.gz
 cd qwen3-audio-api-macos-arm64
 
-# Install ffmpeg (required for audio format conversion)
+# Install ffmpeg CLI (needed at runtime for audio format conversion)
 brew install ffmpeg
 
-# Run the server (see "Download models" below first)
+# Download models (see "Download models" section below)
+# ...
+
+# Run the server with TTS + ASR
 # mlx.metallib is included next to the binary — no extra setup needed
-TTS_CUSTOMVOICE_MODEL_PATH=/path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+TTS_CUSTOMVOICE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  TTS_BASE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-Base \
+  ASR_MODEL_PATH=/path/to/models/Qwen3-ASR-0.6B \
   ./qwen3-audio-api
 ```
 
@@ -250,8 +262,8 @@ The `voice` field accepts OpenAI voice names (mapped to Qwen3-TTS speakers) or Q
 
 ## Output formats
 
-| Format | Content-Type | Requires ffmpeg |
-|--------|-------------|-----------------|
+| Format | Content-Type | Requires ffmpeg CLI |
+|--------|-------------|---------------------|
 | `wav` | `audio/wav` | No |
 | `pcm` | `audio/pcm` | No |
 | `mp3` | `audio/mpeg` | Yes |
@@ -259,15 +271,20 @@ The `voice` field accepts OpenAI voice names (mapped to Qwen3-TTS speakers) or Q
 | `aac` | `audio/aac` | Yes |
 | `flac` | `audio/flac` | Yes |
 
+> WAV and PCM output are handled natively. Other formats use the `ffmpeg` CLI for encoding.
+
 ## Building from source
+
+ffmpeg is built from source and statically linked by default (via the `build-ffmpeg` feature). You do **not** need ffmpeg development libraries installed — only build tools.
 
 ### Linux (libtorch backend)
 
 ```bash
-# Install system dependencies
-# nasm and libclang-dev are needed to build the statically-linked ffmpeg
+# Install build dependencies
+# nasm and libclang-dev are needed to compile the statically-linked ffmpeg
 sudo apt-get install -y cmake pkg-config nasm libclang-dev
-# ffmpeg binary is still needed at runtime for audio format conversion
+
+# Install ffmpeg CLI (needed at runtime for audio format conversion)
 sudo apt-get install -y ffmpeg
 
 # Download libtorch (CPU)
@@ -279,7 +296,7 @@ export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 # For CUDA 12.8 instead, download:
 # wget -q "https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcu128.zip" -O libtorch.zip
 
-# Build
+# Build (ffmpeg is compiled from source and statically linked)
 cd rust
 cargo build --release
 # Binary at: target/release/qwen3-audio-api
@@ -288,12 +305,15 @@ cargo build --release
 ### macOS Apple Silicon (MLX backend)
 
 ```bash
-# Install system dependencies
-brew install ffmpeg cmake
+# Install build dependencies
+brew install cmake
 
-# Build with MLX
+# Install ffmpeg CLI (needed at runtime for audio format conversion)
+brew install ffmpeg
+
+# Build with MLX (ffmpeg is compiled from source and statically linked)
 cd rust
-cargo build --release --no-default-features --features mlx
+cargo build --release --no-default-features --features "mlx build-ffmpeg"
 
 # Copy mlx.metallib next to the binary for redistribution
 cp target/release/build/qwen3_tts-*/out/lib/mlx.metallib target/release/
