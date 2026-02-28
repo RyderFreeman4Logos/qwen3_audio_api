@@ -99,7 +99,7 @@ jobs:
 
       - name: Build with MLX backend
         working-directory: rust
-        run: cargo build --release --no-default-features --features mlx
+        run: cargo build --release --no-default-features --features "mlx build-ffmpeg"
 
       - name: Package archive
         run: |
