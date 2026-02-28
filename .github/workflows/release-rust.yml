@@ -28,6 +28,11 @@ jobs:
           sudo apt-get update && sudo apt-get install -y cmake pkg-config \
             nasm libclang-dev libmp3lame-dev libopus-dev
 
+      - name: Force static linking of lame and opus
+        run: |
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libmp3lame*.so*
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libopus*.so*
+
       - name: Cache libtorch
         id: cache-libtorch
         uses: actions/cache@v4
@@ -86,6 +91,11 @@ jobs:
 
       - name: Install system dependencies
         run: brew install cmake pkg-config nasm lame opus
+
+      - name: Force static linking of lame and opus
+        run: |
+          rm -f /opt/homebrew/lib/libmp3lame*.dylib
+          rm -f /opt/homebrew/lib/libopus*.dylib
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
