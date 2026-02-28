@@ -26,44 +26,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y cmake pkg-config \
-            nasm libclang-dev
-
-      - name: Build static lame
-        run: |
-          curl -L -o lame-3.100.tar.gz \
-            'https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download'
-          tar xzf lame-3.100.tar.gz
-          cd lame-3.100
-          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu \
-            --enable-static --disable-shared --enable-nasm --disable-frontend
-          make -j$(nproc)
-          sudo make install
-
-      - name: Build static opus
-        run: |
-          curl -LO https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
-          tar xzf opus-1.5.2.tar.gz
-          cd opus-1.5.2
-          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu \
-            --enable-static --disable-shared
-          make -j$(nproc)
-          sudo make install
-
-      - name: Verify static libraries
-        run: |
-          echo "=== Verify lame ==="
-          ls -la /usr/lib/x86_64-linux-gnu/libmp3lame* || echo "lame .a not found!"
-          ls -la /usr/include/lame/ || echo "lame headers not found!"
-          echo "=== Verify opus ==="
-          ls -la /usr/lib/x86_64-linux-gnu/libopus* || echo "opus .a not found!"
-          ls -la /usr/lib/x86_64-linux-gnu/pkgconfig/opus.pc || echo "opus.pc not found!"
-          echo "=== pkg-config default search path ==="
-          pkg-config --variable pc_path pkg-config
-          echo "=== pkg-config test ==="
-          pkg-config --libs --cflags opus
-          echo "=== No shared libs ==="
-          ! ls /usr/lib/x86_64-linux-gnu/libmp3lame*.so* 2>/dev/null && echo "PASS: no lame .so"
-          ! ls /usr/lib/x86_64-linux-gnu/libopus*.so* 2>/dev/null && echo "PASS: no opus .so"
+            nasm libclang-dev libmp3lame-dev libopus-dev patchelf
 
       - name: Cache libtorch
         id: cache-libtorch
@@ -91,28 +54,42 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/target
-          key: cargo-release-linux-v5-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: cargo-release-linux-v5-
+          key: cargo-release-linux-v6-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: cargo-release-linux-v6-
 
       - name: Build
         working-directory: rust
         run: cargo build --release
 
-      - name: Verify no dynamic lame/opus dependency
-        run: |
-          echo "=== Shared library dependencies ==="
-          ldd rust/target/release/qwen3-audio-api
-          if ldd rust/target/release/qwen3-audio-api | grep -qE 'libmp3lame|libopus'; then
-            echo "FAIL: binary dynamically links to lame or opus"
-            exit 1
-          fi
-          echo "PASS: lame and opus are statically linked"
-
       - name: Package archive
         run: |
-          mkdir -p staging/qwen3-audio-api-linux-x86_64
+          mkdir -p staging/qwen3-audio-api-linux-x86_64/lib
+
+          # Copy binary
           cp rust/target/release/qwen3-audio-api staging/qwen3-audio-api-linux-x86_64/
+
+          # Bundle libtorch
           cp -r libtorch staging/qwen3-audio-api-linux-x86_64/
+
+          # Bundle lame/opus shared libraries if dynamically linked
+          for lib in mp3lame opus; do
+            so_file=$(ldd rust/target/release/qwen3-audio-api | grep "lib${lib}" | awk '{print $3}')
+            if [ -n "$so_file" ] && [ -f "$so_file" ]; then
+              echo "Bundling $so_file"
+              cp "$so_file" staging/qwen3-audio-api-linux-x86_64/lib/
+            fi
+          done
+
+          # Set RPATH so binary finds bundled libs at runtime
+          patchelf --set-rpath '$ORIGIN/lib:$ORIGIN/libtorch/lib' \
+            staging/qwen3-audio-api-linux-x86_64/qwen3-audio-api
+
+          # Verify
+          echo "=== Bundled libraries ==="
+          ls -la staging/qwen3-audio-api-linux-x86_64/lib/ || echo "(no extra libs needed)"
+          echo "=== RPATH ==="
+          patchelf --print-rpath staging/qwen3-audio-api-linux-x86_64/qwen3-audio-api
+
           tar -czf qwen3-audio-api-linux-x86_64.tar.gz -C staging qwen3-audio-api-linux-x86_64
 
       - name: Upload artifact
@@ -132,42 +109,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install system dependencies
-        run: brew install cmake pkg-config nasm
-
-      - name: Build static lame
-        run: |
-          curl -L -o lame-3.100.tar.gz \
-            'https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download'
-          tar xzf lame-3.100.tar.gz
-          cd lame-3.100
-          ./configure --prefix=/opt/homebrew --enable-static --disable-shared \
-            --disable-frontend
-          make -j$(sysctl -n hw.ncpu)
-          make install
-
-      - name: Build static opus
-        run: |
-          curl -LO https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
-          tar xzf opus-1.5.2.tar.gz
-          cd opus-1.5.2
-          ./configure --prefix=/opt/homebrew --enable-static --disable-shared
-          make -j$(sysctl -n hw.ncpu)
-          make install
-
-      - name: Verify static libraries
-        run: |
-          echo "=== Verify lame ==="
-          ls -la /opt/homebrew/lib/libmp3lame* || echo "lame .a not found!"
-          echo "=== Verify opus ==="
-          ls -la /opt/homebrew/lib/libopus* || echo "opus .a not found!"
-          ls -la /opt/homebrew/lib/pkgconfig/opus.pc || echo "opus.pc not found!"
-          echo "=== pkg-config default search path ==="
-          pkg-config --variable pc_path pkg-config
-          echo "=== pkg-config test ==="
-          pkg-config --libs --cflags opus
-          echo "=== No shared libs ==="
-          ! ls /opt/homebrew/lib/libmp3lame*.dylib 2>/dev/null && echo "PASS: no lame .dylib"
-          ! ls /opt/homebrew/lib/libopus*.dylib 2>/dev/null && echo "PASS: no opus .dylib"
+        run: brew install cmake pkg-config nasm lame opus
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -176,8 +118,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/target
-          key: cargo-release-macos-arm64-v5-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: cargo-release-macos-arm64-v5-
+          key: cargo-release-macos-arm64-v6-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: cargo-release-macos-arm64-v6-
 
       - name: Build with MLX backend
         working-directory: rust
@@ -186,27 +128,46 @@ jobs:
           LDFLAGS: "-L/opt/homebrew/lib"
         run: cargo build --release --no-default-features --features "mlx build-ffmpeg"
 
-      - name: Verify no dynamic lame/opus dependency
-        run: |
-          echo "=== Shared library dependencies ==="
-          otool -L rust/target/release/qwen3-audio-api
-          if otool -L rust/target/release/qwen3-audio-api | grep -qE 'libmp3lame|libopus'; then
-            echo "FAIL: binary dynamically links to lame or opus"
-            exit 1
-          fi
-          echo "PASS: lame and opus are statically linked"
-
       - name: Package archive
         run: |
+          BINARY=rust/target/release/qwen3-audio-api
           METALLIB=$(find rust/target/release/build -path '*/qwen3_tts-*/out/lib/mlx.metallib' | head -1)
           if [ -z "$METALLIB" ]; then
             echo "ERROR: mlx.metallib not found in build artifacts"
             exit 1
           fi
           echo "Found metallib at: $METALLIB ($(stat -f%z "$METALLIB") bytes)"
-          mkdir -p staging/qwen3-audio-api-macos-arm64
-          cp rust/target/release/qwen3-audio-api staging/qwen3-audio-api-macos-arm64/
+
+          mkdir -p staging/qwen3-audio-api-macos-arm64/lib
+
+          # Bundle any dynamically linked lame/opus libs and fix paths
+          for lib in mp3lame opus; do
+            dylib_ref=$(otool -L "$BINARY" | grep "lib${lib}" | awk '{print $1}')
+            if [ -n "$dylib_ref" ]; then
+              # Find the actual dylib file
+              dylib_file=$(echo "$dylib_ref" | sed 's|@rpath/||')
+              if [ -f "$dylib_ref" ]; then
+                dylib_file="$dylib_ref"
+              elif [ -f "/opt/homebrew/lib/$(basename $dylib_ref)" ]; then
+                dylib_file="/opt/homebrew/lib/$(basename $dylib_ref)"
+              fi
+              echo "Bundling $dylib_file (ref: $dylib_ref)"
+              cp "$dylib_file" staging/qwen3-audio-api-macos-arm64/lib/
+              # Rewrite the reference to use @executable_path/lib/
+              install_name_tool -change "$dylib_ref" \
+                "@executable_path/lib/$(basename $dylib_file)" "$BINARY"
+            fi
+          done
+
+          cp "$BINARY" staging/qwen3-audio-api-macos-arm64/
           cp "$METALLIB" staging/qwen3-audio-api-macos-arm64/
+
+          # Verify
+          echo "=== Final otool -L ==="
+          otool -L staging/qwen3-audio-api-macos-arm64/qwen3-audio-api
+          echo "=== Bundled libraries ==="
+          ls -la staging/qwen3-audio-api-macos-arm64/lib/ || echo "(no extra libs needed)"
+
           tar -czf qwen3-audio-api-macos-arm64.tar.gz -C staging qwen3-audio-api-macos-arm64
 
       - name: Upload artifact
