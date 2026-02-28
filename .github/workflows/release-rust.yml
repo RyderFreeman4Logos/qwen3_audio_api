@@ -181,6 +181,9 @@ jobs:
 
       - name: Build with MLX backend
         working-directory: rust
+        env:
+          CFLAGS: "-I/opt/homebrew/include"
+          LDFLAGS: "-L/opt/homebrew/lib"
         run: cargo build --release --no-default-features --features "mlx build-ffmpeg"
 
       - name: Verify no dynamic lame/opus dependency
