@@ -77,9 +77,8 @@ fn encode_with_ffmpeg_lib(
         .ok_or_else(|| ApiError::internal(format!("Encoder not found for {codec_id:?}")))?;
 
     // Determine encoder's preferred sample format
-    let default_sample_fmt = ffmpeg_next::format::Sample::I16(
-        ffmpeg_next::format::sample::Type::Packed,
-    );
+    let default_sample_fmt =
+        ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed);
     let enc_sample_format = encoder_codec
         .audio()
         .ok()
@@ -110,7 +109,11 @@ fn encode_with_ffmpeg_lib(
     let mut context_encoder = ffmpeg_next::codec::context::Context::new_with_codec(encoder_codec);
 
     // If the output format requires global header, set the codec flag before opening
-    if octx.format().flags().contains(ffmpeg_next::format::flag::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg_next::format::flag::Flags::GLOBAL_HEADER)
+    {
         unsafe {
             (*context_encoder.as_mut_ptr()).flags |=
                 ffmpeg_next::codec::flag::Flags::GLOBAL_HEADER.bits() as i32;
@@ -144,7 +147,8 @@ fn encode_with_ffmpeg_lib(
     // Check if we need a resampler (rate change or complex format conversion)
     // For same-rate S16 encoding, convert samples directly for better compatibility
     let needs_resampler = sample_rate != enc_rate
-        || enc_sample_format != ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed);
+        || enc_sample_format
+            != ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed);
 
     let mut resampler = if needs_resampler {
         Some(
@@ -178,14 +182,17 @@ fn encode_with_ffmpeg_lib(
 
         if let Some(ref mut resampler) = resampler {
             // Use resampler for rate conversion or complex format changes
-            let mut frame = ffmpeg_next::frame::Audio::new(src_format, chunk_len, ffmpeg_next::ChannelLayout::MONO);
+            let mut frame = ffmpeg_next::frame::Audio::new(
+                src_format,
+                chunk_len,
+                ffmpeg_next::ChannelLayout::MONO,
+            );
             frame.set_rate(sample_rate);
             frame.set_pts(Some(pts));
 
             let data = frame.data_mut(0);
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts(chunk.as_ptr() as *const u8, chunk.len() * 4)
-            };
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const u8, chunk.len() * 4) };
             data[..byte_slice.len()].copy_from_slice(byte_slice);
 
             let mut resampled = ffmpeg_next::frame::Audio::empty();
@@ -333,11 +340,7 @@ pub fn convert_audio_to_wav_bytes(
 /// Transcode audio to mono WAV at the given sample rate using ffmpeg for decoding
 /// and hound for WAV output. Decodes any audio format, converts to f32 samples,
 /// resamples if needed, then writes as 16-bit PCM WAV.
-fn transcode_to_wav(
-    input_path: &str,
-    output_path: &str,
-    target_rate: u32,
-) -> Result<(), ApiError> {
+fn transcode_to_wav(input_path: &str, output_path: &str, target_rate: u32) -> Result<(), ApiError> {
     ffmpeg_next::init()
         .map_err(|e| ApiError::internal(format!("Failed to initialize ffmpeg: {e}")))?;
 
@@ -365,14 +368,14 @@ fn transcode_to_wav(
     let mut source_channels: Option<u16> = None;
 
     let decode_frame = |decoder: &mut ffmpeg_next::decoder::Audio,
-                            all_samples: &mut Vec<f32>,
-                            decoded_frame: &mut ffmpeg_next::frame::Audio,
-                            source_rate: &mut Option<u32>,
-                            source_channels: &mut Option<u16>|
+                        all_samples: &mut Vec<f32>,
+                        decoded_frame: &mut ffmpeg_next::frame::Audio,
+                        source_rate: &mut Option<u32>,
+                        source_channels: &mut Option<u16>|
      -> Result<(), ApiError> {
         while decoder.receive_frame(decoded_frame).is_ok() {
             let rate = decoded_frame.rate();
-            let channels = decoded_frame.channels() as u16;
+            let channels = decoded_frame.channels();
             let samples = decoded_frame.samples();
             let format = decoded_frame.format();
 
@@ -387,7 +390,9 @@ fn transcode_to_wav(
                 let mut sum = 0.0f32;
                 for ch in 0..channels as usize {
                     let sample = match format {
-                        ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed) => {
+                        ffmpeg_next::format::Sample::I16(
+                            ffmpeg_next::format::sample::Type::Packed,
+                        ) => {
                             let data = decoded_frame.data(0);
                             let offset = (i * channels as usize + ch) * 2;
                             if offset + 1 < data.len() {
@@ -397,7 +402,9 @@ fn transcode_to_wav(
                                 0.0
                             }
                         }
-                        ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Planar) => {
+                        ffmpeg_next::format::Sample::I16(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        ) => {
                             let data = decoded_frame.data(ch);
                             let offset = i * 2;
                             if offset + 1 < data.len() {
@@ -407,47 +414,67 @@ fn transcode_to_wav(
                                 0.0
                             }
                         }
-                        ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Packed) => {
+                        ffmpeg_next::format::Sample::I32(
+                            ffmpeg_next::format::sample::Type::Packed,
+                        ) => {
                             let data = decoded_frame.data(0);
                             let offset = (i * channels as usize + ch) * 4;
                             if offset + 3 < data.len() {
                                 let val = i32::from_le_bytes([
-                                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
                                 ]);
                                 val as f32 / 2147483648.0
                             } else {
                                 0.0
                             }
                         }
-                        ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Planar) => {
+                        ffmpeg_next::format::Sample::I32(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        ) => {
                             let data = decoded_frame.data(ch);
                             let offset = i * 4;
                             if offset + 3 < data.len() {
                                 let val = i32::from_le_bytes([
-                                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
                                 ]);
                                 val as f32 / 2147483648.0
                             } else {
                                 0.0
                             }
                         }
-                        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed) => {
+                        ffmpeg_next::format::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Packed,
+                        ) => {
                             let data = decoded_frame.data(0);
                             let offset = (i * channels as usize + ch) * 4;
                             if offset + 3 < data.len() {
                                 f32::from_le_bytes([
-                                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
                                 ])
                             } else {
                                 0.0
                             }
                         }
-                        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar) => {
+                        ffmpeg_next::format::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        ) => {
                             let data = decoded_frame.data(ch);
                             let offset = i * 4;
                             if offset + 3 < data.len() {
                                 f32::from_le_bytes([
-                                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
                                 ])
                             } else {
                                 0.0

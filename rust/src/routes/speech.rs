@@ -10,10 +10,8 @@ use std::time::Duration;
 use crate::audio::{apply_speed, encode_audio};
 use crate::config::{resolve_voice, ResponseFormat};
 use crate::error::ApiError;
-use crate::state::{AppState, Models};
+use crate::state::{AcquireSpeechSlotError, AppState, Models};
 
-const MODEL_INPUT_MAX_BYTES: usize = 4096;
-const SEGMENT_GAP_SECONDS: f32 = 0.12;
 const LOCK_RETRY_INTERVAL_MS: u64 = 20;
 
 // ---------------------------------------------------------------------------
@@ -103,6 +101,11 @@ pub async fn speech_handler(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
 ) -> Result<Response, ApiError> {
+    let _slot = state
+        .acquire_speech_slot()
+        .await
+        .map_err(map_acquire_slot_error)?;
+
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -114,16 +117,22 @@ pub async fn speech_handler(
         let multipart = Multipart::from_request(request, &()).await.map_err(|e| {
             ApiError::unprocessable(format!("Failed to parse multipart request: {e}"))
         })?;
-        speech_multipart(state, multipart).await
+        speech_multipart(state.clone(), multipart).await
     } else {
         let bytes = Bytes::from_request(request, &()).await.map_err(
             |e: axum::extract::rejection::BytesRejection| {
                 ApiError::unprocessable(format!("Failed to read request body: {e}"))
             },
         )?;
+        if bytes.len() > state.speech_runtime.max_request_body_bytes {
+            return Err(ApiError::payload_too_large(format!(
+                "request body exceeds {} bytes",
+                state.speech_runtime.max_request_body_bytes
+            )));
+        }
         let req: SpeechRequest = serde_json::from_slice(&bytes)
             .map_err(|e| ApiError::unprocessable(format!("Invalid JSON: {e}")))?;
-        speech_json(state, req).await
+        speech_json(state.clone(), req).await
     }
 }
 
@@ -254,6 +263,7 @@ async fn speech_multipart(state: AppState, mut multipart: Multipart) -> Result<R
                         .bytes()
                         .await
                         .map_err(|e| ApiError::unprocessable(e.to_string()))?;
+                    validate_audio_sample_size(&state, bytes.len())?;
                     audio_sample = Some(AudioSampleData::Bytes(bytes.to_vec()));
                 } else {
                     let text = field
@@ -312,7 +322,14 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
         audio_sample,
         audio_sample_text,
     } = params;
-    let segments = split_text_for_tts(&input, MODEL_INPUT_MAX_BYTES);
+    let segments = split_text_for_tts(&input, state.speech_runtime.segment_max_bytes);
+    tracing::info!(
+        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}",
+        task_id,
+        input.chars().count(),
+        segments.len(),
+        state.speech_runtime.segment_max_bytes
+    );
 
     let (waveform, sample_rate) = tokio::task::spawn_blocking(move || {
         let models = lock_models_with_cancellation(&state, task_id)?;
@@ -349,10 +366,12 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(&b64)
                         .map_err(|e| ApiError::bad_request(format!("Invalid base64: {e}")))?;
+                    validate_audio_sample_size(&state, bytes.len())?;
                     qwen3_tts::audio::load_wav_bytes(&bytes)
                         .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
                 }
                 AudioSampleData::Bytes(bytes) => {
+                    validate_audio_sample_size(&state, bytes.len())?;
                     qwen3_tts::audio::load_wav_bytes(&bytes)
                         .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
                 }
@@ -388,6 +407,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
 
                 for segment in &segments {
                     ensure_task_not_cancelled(&state, task_id)?;
+                    let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
                     let (segment_waveform, segment_sample_rate) = base_model
                         .generate_with_icl(
                             segment,
@@ -397,7 +417,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                             &language,
                             0.9,
                             50,
-                            2048,
+                            max_codes,
                         )
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     append_segment_audio(
@@ -405,12 +425,14 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         &mut merged_sample_rate,
                         segment_waveform,
                         segment_sample_rate,
+                        state.speech_runtime.segment_gap_seconds,
                     )?;
                 }
             } else {
                 // X-vector only mode
                 for segment in &segments {
                     ensure_task_not_cancelled(&state, task_id)?;
+                    let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
                     let (segment_waveform, segment_sample_rate) = base_model
                         .generate_with_xvector(
                             segment,
@@ -418,7 +440,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                             &language,
                             0.9,
                             50,
-                            2048,
+                            max_codes,
                         )
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     append_segment_audio(
@@ -426,6 +448,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         &mut merged_sample_rate,
                         segment_waveform,
                         segment_sample_rate,
+                        state.speech_runtime.segment_gap_seconds,
                     )?;
                 }
             }
@@ -451,6 +474,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
             let mut merged_sample_rate = None;
             for segment in &segments {
                 ensure_task_not_cancelled(&state, task_id)?;
+                let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
                 let (segment_waveform, segment_sample_rate) = model
                     .generate_with_instruct(
                         segment,
@@ -459,7 +483,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         instruct,
                         0.9,
                         50,
-                        2048,
+                        max_codes,
                     )
                     .map_err(|e| ApiError::internal(e.to_string()))?;
                 append_segment_audio(
@@ -467,6 +491,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                     &mut merged_sample_rate,
                     segment_waveform,
                     segment_sample_rate,
+                    state.speech_runtime.segment_gap_seconds,
                 )?;
             }
             Ok::<(Vec<f32>, u32), ApiError>((merged_waveform, merged_sample_rate.unwrap_or(24000)))
@@ -504,6 +529,29 @@ fn validate_input(input: &str, speed: f32) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_audio_sample_size(state: &AppState, bytes: usize) -> Result<(), ApiError> {
+    if bytes > state.speech_runtime.max_audio_sample_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "audio_sample exceeds {} bytes",
+            state.speech_runtime.max_audio_sample_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn map_acquire_slot_error(err: AcquireSpeechSlotError) -> ApiError {
+    match err {
+        AcquireSpeechSlotError::QueueFull { queued, limit } => ApiError::too_many_requests(
+            format!(
+                "speech queue is full (queued={queued}, limit={limit}); retry later or reduce concurrency"
+            ),
+        ),
+        AcquireSpeechSlotError::GateClosed => {
+            ApiError::internal("speech request gate is unavailable")
+        }
+    }
+}
+
 fn lock_models_with_cancellation<'a>(
     state: &'a AppState,
     task_id: u64,
@@ -538,6 +586,7 @@ fn append_segment_audio(
     merged_sample_rate: &mut Option<u32>,
     segment_waveform: Vec<f32>,
     segment_sample_rate: u32,
+    segment_gap_seconds: f32,
 ) -> Result<(), ApiError> {
     if let Some(rate) = *merged_sample_rate {
         if rate != segment_sample_rate {
@@ -550,8 +599,8 @@ fn append_segment_audio(
     }
 
     if !merged_waveform.is_empty() {
-        let gap_samples = ((segment_sample_rate as f32) * SEGMENT_GAP_SECONDS).round() as usize;
-        merged_waveform.extend(std::iter::repeat(0.0).take(gap_samples));
+        let gap_samples = ((segment_sample_rate as f32) * segment_gap_seconds).round() as usize;
+        merged_waveform.extend(std::iter::repeat_n(0.0, gap_samples));
     }
     merged_waveform.extend(segment_waveform);
     Ok(())
@@ -599,9 +648,9 @@ fn split_text_for_tts(input: &str, max_bytes: usize) -> Vec<String> {
         } else {
             boundary_positions
                 .iter()
+                .rev()
                 .copied()
-                .take_while(|&b| b > start && b <= hard_limit)
-                .last()
+                .find(|&b| b > start && b <= hard_limit)
                 .unwrap_or_else(|| {
                     let mut boundary = hard_limit;
                     while boundary > start && !text.is_char_boundary(boundary) {
@@ -654,33 +703,45 @@ fn is_preferred_boundary(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_text_for_tts, MODEL_INPUT_MAX_BYTES};
+    use super::split_text_for_tts;
+
+    const TEST_MAX_BYTES: usize = 4096;
 
     #[test]
     fn split_text_keeps_short_input_single_segment() {
         let input = "这是短文本。";
-        let chunks = split_text_for_tts(input, MODEL_INPUT_MAX_BYTES);
+        let chunks = split_text_for_tts(input, TEST_MAX_BYTES);
         assert_eq!(chunks, vec![input.to_string()]);
     }
 
     #[test]
     fn split_text_breaks_long_chinese_input() {
         let input = "第一段。第二段！第三段？".repeat(600);
-        let chunks = split_text_for_tts(&input, MODEL_INPUT_MAX_BYTES);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.len() <= MODEL_INPUT_MAX_BYTES));
+        assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
     }
 
     #[test]
     fn split_text_handles_long_unpunctuated_input() {
         let input = "啊".repeat(5000);
-        let chunks = split_text_for_tts(&input, MODEL_INPUT_MAX_BYTES);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES);
         assert!(chunks.len() > 1);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.len() <= MODEL_INPUT_MAX_BYTES));
+        assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
+    }
+
+    #[test]
+    fn split_text_prefers_sentence_boundaries_under_limit() {
+        let input = "第一段。第二段。第三段。";
+        let chunks = split_text_for_tts(input, 16);
+        assert_eq!(
+            chunks,
+            vec![
+                "第一段。".to_string(),
+                "第二段。".to_string(),
+                "第三段。".to_string()
+            ]
+        );
     }
 }

@@ -195,7 +195,17 @@ async fn main() -> anyhow::Result<()> {
         models.asr = Some(asr);
     }
 
-    let state = new_app_state(models);
+    tracing::info!(
+        "Speech runtime: segment_max_bytes={}, concurrent={}, queued={}, incremental={}, max_codes={}, vocoder_chunk={}",
+        config.speech_runtime.segment_max_bytes,
+        config.speech_runtime.max_concurrent_speech_requests,
+        config.speech_runtime.max_queued_speech_requests,
+        config.speech_runtime.incremental_enabled,
+        config.speech_runtime.max_generation_codes,
+        config.speech_runtime.vocoder_chunk_codes
+    );
+
+    let state = new_app_state(models, config.speech_runtime.clone());
 
     // Build router
     let app = Router::new()

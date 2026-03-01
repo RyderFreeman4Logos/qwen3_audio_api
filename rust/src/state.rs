@@ -1,10 +1,13 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use qwen3_asr::inference::AsrInference;
 use qwen3_tts::audio_encoder::AudioEncoder;
 use qwen3_tts::inference::TTSInference;
 use qwen3_tts::speaker_encoder::SpeakerEncoder;
+use tokio::sync::{Semaphore, SemaphorePermit};
+
+use crate::config::SpeechRuntimeConfig;
 
 /// Models that may be loaded at startup.
 pub struct Models {
@@ -103,6 +106,9 @@ impl SpeechTaskControl {
 pub struct AppContext {
     pub models: Mutex<Models>,
     pub speech_tasks: SpeechTaskControl,
+    pub speech_runtime: SpeechRuntimeConfig,
+    speech_inference_slots: Semaphore,
+    queued_speech_waiters: AtomicUsize,
 }
 
 impl AppContext {
@@ -120,6 +126,32 @@ impl AppContext {
             }
         }
     }
+
+    /// Acquire an inference slot with bounded queueing.
+    pub async fn acquire_speech_slot(&self) -> Result<SemaphorePermit<'_>, AcquireSpeechSlotError> {
+        let waiting_now = self.queued_speech_waiters.fetch_add(1, Ordering::SeqCst) + 1;
+        if waiting_now > self.speech_runtime.max_queued_speech_requests {
+            self.queued_speech_waiters.fetch_sub(1, Ordering::SeqCst);
+            return Err(AcquireSpeechSlotError::QueueFull {
+                queued: waiting_now,
+                limit: self.speech_runtime.max_queued_speech_requests,
+            });
+        }
+
+        let permit = self
+            .speech_inference_slots
+            .acquire()
+            .await
+            .map_err(|_| AcquireSpeechSlotError::GateClosed)?;
+        self.queued_speech_waiters.fetch_sub(1, Ordering::SeqCst);
+        Ok(permit)
+    }
+}
+
+#[derive(Debug)]
+pub enum AcquireSpeechSlotError {
+    QueueFull { queued: usize, limit: usize },
+    GateClosed,
 }
 
 /// Shared application state threaded through all handlers.
@@ -127,16 +159,21 @@ impl AppContext {
 /// as the Python server's threading.Lock.
 pub type AppState = Arc<AppContext>;
 
-pub fn new_app_state(models: Models) -> AppState {
+pub fn new_app_state(models: Models, speech_runtime: SpeechRuntimeConfig) -> AppState {
+    let max_concurrency = speech_runtime.max_concurrent_speech_requests;
     Arc::new(AppContext {
         models: Mutex::new(models),
         speech_tasks: SpeechTaskControl::new(),
+        speech_runtime,
+        speech_inference_slots: Semaphore::new(max_concurrency),
+        queued_speech_waiters: AtomicUsize::new(0),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{new_app_state, Models};
+    use crate::config::SpeechRuntimeConfig;
 
     fn empty_models() -> Models {
         Models {
@@ -153,15 +190,16 @@ mod tests {
 
     #[test]
     fn lock_models_recover_works_after_poison() {
-        let state = new_app_state(empty_models());
+        let runtime = SpeechRuntimeConfig::from_env().expect("default runtime config should parse");
+        let state = new_app_state(empty_models(), runtime);
 
-        let _ = std::panic::catch_unwind({
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let state = state.clone();
             move || {
                 let _guard = state.models.lock().expect("lock should succeed");
                 panic!("force poison");
             }
-        });
+        }));
 
         let guard = state.lock_models_recover();
         assert!(guard.custom_voice.is_none());
