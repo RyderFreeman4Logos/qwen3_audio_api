@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use qwen3_asr::inference::AsrInference;
 use qwen3_tts::audio_encoder::AudioEncoder;
@@ -105,6 +105,23 @@ pub struct AppContext {
     pub speech_tasks: SpeechTaskControl,
 }
 
+impl AppContext {
+    /// Acquire the models lock and recover automatically from poison.
+    ///
+    /// A previous panic while holding the lock should not permanently block
+    /// all subsequent requests; we log and continue with the contained state.
+    pub fn lock_models_recover(&self) -> MutexGuard<'_, Models> {
+        match self.models.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("recovering from poisoned models mutex");
+                self.models.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
 /// Shared application state threaded through all handlers.
 /// The Mutex provides the same single-request-at-a-time guarantee
 /// as the Python server's threading.Lock.
@@ -115,4 +132,38 @@ pub fn new_app_state(models: Models) -> AppState {
         models: Mutex::new(models),
         speech_tasks: SpeechTaskControl::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{new_app_state, Models};
+
+    fn empty_models() -> Models {
+        Models {
+            custom_voice: None,
+            base_model: None,
+            speaker_encoder: None,
+            audio_encoder: None,
+            asr: None,
+            default_audio_sample_wav_bytes: None,
+            default_audio_sample_text: None,
+            default_instructions: None,
+        }
+    }
+
+    #[test]
+    fn lock_models_recover_works_after_poison() {
+        let state = new_app_state(empty_models());
+
+        let _ = std::panic::catch_unwind({
+            let state = state.clone();
+            move || {
+                let _guard = state.models.lock().expect("lock should succeed");
+                panic!("force poison");
+            }
+        });
+
+        let guard = state.lock_models_recover();
+        assert!(guard.custom_voice.is_none());
+    }
 }

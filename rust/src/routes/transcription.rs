@@ -94,10 +94,7 @@ pub async fn transcribe(
     let lang = language.clone();
     let wav_path_str = wav_path.clone();
     let text = tokio::task::spawn_blocking(move || {
-        let models = state
-            .models
-            .lock()
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let models = state.lock_models_recover();
         let asr = models.asr.as_ref().ok_or_else(|| {
             ApiError::bad_request(
                 "ASR model is not loaded. Set ASR_MODEL_PATH to enable transcription.",

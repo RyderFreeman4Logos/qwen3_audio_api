@@ -516,7 +516,9 @@ fn lock_models_with_cancellation<'a>(
                 std::thread::sleep(Duration::from_millis(LOCK_RETRY_INTERVAL_MS));
             }
             Err(TryLockError::Poisoned(e)) => {
-                return Err(ApiError::internal(format!("State lock poisoned: {e}")));
+                tracing::warn!("recovering from poisoned models mutex in speech route");
+                state.models.clear_poison();
+                return Ok(e.into_inner());
             }
         }
     }

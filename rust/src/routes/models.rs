@@ -18,7 +18,7 @@ struct ModelsResponse {
 }
 
 pub async fn list_models(State(state): State<AppState>) -> impl axum::response::IntoResponse {
-    let models = state.models.lock().unwrap();
+    let models = state.lock_models_recover();
     let mut data = Vec::new();
 
     if models.custom_voice.is_some() || models.base_model.is_some() {
