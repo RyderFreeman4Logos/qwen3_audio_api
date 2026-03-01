@@ -75,6 +75,14 @@ struct CancelSpeechResponse {
     cancelled_up_to_task_id: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct SpeechStatusResponse {
+    ok: bool,
+    current_task_id: Option<u64>,
+    completed_segments: u64,
+    total_segments: u64,
+}
+
 struct CurrentSpeechTaskGuard {
     state: AppState,
     task_id: u64,
@@ -169,6 +177,19 @@ pub async fn cancel_all_handler(
         ),
         current_task_id,
         cancelled_up_to_task_id,
+    })
+}
+
+pub async fn status_handler(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let current_task_id = state.speech_tasks.current_task_id();
+    let (completed_segments, total_segments) =
+        state.speech_tasks.current_task_progress().unwrap_or((0, 0));
+
+    axum::Json(SpeechStatusResponse {
+        ok: true,
+        current_task_id,
+        completed_segments,
+        total_segments,
     })
 }
 
@@ -330,19 +351,24 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
         state.speech_runtime.segment_break_on_commas,
     );
     tracing::info!(
-        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}, segment_max_chars={}, segment_target_max_codes={}, split_on_commas={}",
+        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}, segment_max_chars={}, segment_target_max_codes={}, split_on_commas={}, temperature={}, top_k={}",
         task_id,
         input.chars().count(),
         segments.len(),
         state.speech_runtime.segment_max_bytes,
         segment_max_chars,
         state.speech_runtime.segment_target_max_codes,
-        state.speech_runtime.segment_break_on_commas
+        state.speech_runtime.segment_break_on_commas,
+        state.speech_runtime.generation_temperature,
+        state.speech_runtime.generation_top_k
     );
 
     let (waveform, sample_rate) = tokio::task::spawn_blocking(move || {
         let models = lock_models_with_cancellation(&state, task_id)?;
         let _task_guard = CurrentSpeechTaskGuard::new(state.clone(), task_id);
+        state
+            .speech_tasks
+            .set_current_task_total_segments(task_id, segments.len() as u64);
         ensure_task_not_cancelled(&state, task_id)?;
 
         let mut effective_audio_sample = audio_sample;
@@ -432,8 +458,8 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                             &ref_codes,
                             &speaker_embedding,
                             &language,
-                            0.9,
-                            50,
+                            state.speech_runtime.generation_temperature,
+                            state.speech_runtime.generation_top_k,
                             max_codes,
                         )
                         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -444,6 +470,9 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         segment_sample_rate,
                         state.speech_runtime.segment_gap_seconds,
                     )?;
+                    state
+                        .speech_tasks
+                        .set_current_task_completed_segments(task_id, (segment_idx + 1) as u64);
                 }
             } else {
                 // X-vector only mode
@@ -463,8 +492,8 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                             segment,
                             &speaker_embedding,
                             &language,
-                            0.9,
-                            50,
+                            state.speech_runtime.generation_temperature,
+                            state.speech_runtime.generation_top_k,
                             max_codes,
                         )
                         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -475,6 +504,9 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         segment_sample_rate,
                         state.speech_runtime.segment_gap_seconds,
                     )?;
+                    state
+                        .speech_tasks
+                        .set_current_task_completed_segments(task_id, (segment_idx + 1) as u64);
                 }
             }
             Ok::<(Vec<f32>, u32), ApiError>((merged_waveform, merged_sample_rate.unwrap_or(24000)))
@@ -514,8 +546,8 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         &speaker_name,
                         &language,
                         instruct,
-                        0.9,
-                        50,
+                        state.speech_runtime.generation_temperature,
+                        state.speech_runtime.generation_top_k,
                         max_codes,
                     )
                     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -526,6 +558,9 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                     segment_sample_rate,
                     state.speech_runtime.segment_gap_seconds,
                 )?;
+                state
+                    .speech_tasks
+                    .set_current_task_completed_segments(task_id, (segment_idx + 1) as u64);
             }
             Ok::<(Vec<f32>, u32), ApiError>((merged_waveform, merged_sample_rate.unwrap_or(24000)))
         }

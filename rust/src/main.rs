@@ -196,13 +196,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!(
-        "Speech runtime: segment_max_bytes={}, concurrent={}, queued={}, incremental={}, max_codes={}, vocoder_chunk={}",
+        "Speech runtime: segment_max_bytes={}, concurrent={}, queued={}, incremental={}, max_codes={}, vocoder_chunk={}, temperature={}, top_k={}",
         config.speech_runtime.segment_max_bytes,
         config.speech_runtime.max_concurrent_speech_requests,
         config.speech_runtime.max_queued_speech_requests,
         config.speech_runtime.incremental_enabled,
         config.speech_runtime.max_generation_codes,
-        config.speech_runtime.vocoder_chunk_codes
+        config.speech_runtime.vocoder_chunk_codes,
+        config.speech_runtime.generation_temperature,
+        config.speech_runtime.generation_top_k
     );
 
     let state = new_app_state(models, config.speech_runtime.clone());
@@ -217,6 +219,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/audio/speech/cancel-all",
             post(routes::speech::cancel_all_handler),
+        )
+        .route(
+            "/v1/audio/speech/status",
+            get(routes::speech::status_handler),
         )
         .route(
             "/v1/audio/transcriptions",

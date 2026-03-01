@@ -14,6 +14,8 @@ const DEFAULT_CODES_PER_CHAR: f32 = 3.8;
 const DEFAULT_VOCODER_CHUNK_CODES: i64 = 0;
 const DEFAULT_SEGMENT_TARGET_MAX_CODES: i64 = 640;
 const DEFAULT_SEGMENT_BREAK_ON_COMMAS: bool = false;
+const DEFAULT_TTS_TEMPERATURE: f64 = 0.9;
+const DEFAULT_TTS_TOP_K: i64 = 50;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -30,6 +32,13 @@ fn env_i64(name: &str, default: i64) -> i64 {
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -79,6 +88,10 @@ pub struct SpeechRuntimeConfig {
     pub segment_target_max_codes: i64,
     /// Enables comma-level split points for conservative long-text synthesis.
     pub segment_break_on_commas: bool,
+    /// Sampling temperature used for all TTS generation paths.
+    pub generation_temperature: f64,
+    /// Top-k sampling used for all TTS generation paths.
+    pub generation_top_k: i64,
     /// Enables adaptive generation budgeting (rollback: set to 0).
     pub incremental_enabled: bool,
 }
@@ -136,6 +149,8 @@ impl SpeechRuntimeConfig {
                 "RUST_TTS_SEGMENT_BREAK_ON_COMMAS",
                 DEFAULT_SEGMENT_BREAK_ON_COMMAS,
             ),
+            generation_temperature: env_f64("RUST_TTS_TEMPERATURE", DEFAULT_TTS_TEMPERATURE),
+            generation_top_k: env_i64("RUST_TTS_TOP_K", DEFAULT_TTS_TOP_K),
             incremental_enabled: env_bool("RUST_TTS_INCREMENTAL", true),
         };
 
@@ -180,6 +195,12 @@ impl SpeechRuntimeConfig {
         }
         if cfg.segment_target_max_codes <= 0 {
             return Err("RUST_TTS_SEGMENT_TARGET_MAX_CODES must be > 0".to_string());
+        }
+        if !(0.0..=2.0).contains(&cfg.generation_temperature) {
+            return Err("RUST_TTS_TEMPERATURE must be in [0.0, 2.0]".to_string());
+        }
+        if cfg.generation_top_k <= 0 {
+            return Err("RUST_TTS_TOP_K must be > 0".to_string());
         }
 
         Ok(cfg)

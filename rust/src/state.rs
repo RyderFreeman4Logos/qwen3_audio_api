@@ -34,6 +34,8 @@ pub struct SpeechTaskControl {
     next_task_id: AtomicU64,
     current_task_id: AtomicU64,
     cancelled_up_to_task_id: AtomicU64,
+    current_task_total_segments: AtomicU64,
+    current_task_completed_segments: AtomicU64,
 }
 
 impl SpeechTaskControl {
@@ -42,6 +44,8 @@ impl SpeechTaskControl {
             next_task_id: AtomicU64::new(1),
             current_task_id: AtomicU64::new(0),
             cancelled_up_to_task_id: AtomicU64::new(0),
+            current_task_total_segments: AtomicU64::new(0),
+            current_task_completed_segments: AtomicU64::new(0),
         }
     }
 
@@ -51,12 +55,18 @@ impl SpeechTaskControl {
 
     pub fn set_current_task_id(&self, task_id: u64) {
         self.current_task_id.store(task_id, Ordering::SeqCst);
+        self.current_task_total_segments.store(0, Ordering::SeqCst);
+        self.current_task_completed_segments
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn clear_current_task_id(&self, task_id: u64) {
         let current = self.current_task_id.load(Ordering::SeqCst);
         if current == task_id {
             self.current_task_id.store(0, Ordering::SeqCst);
+            self.current_task_total_segments.store(0, Ordering::SeqCst);
+            self.current_task_completed_segments
+                .store(0, Ordering::SeqCst);
         }
     }
 
@@ -67,6 +77,42 @@ impl SpeechTaskControl {
         } else {
             Some(id)
         }
+    }
+
+    pub fn set_current_task_total_segments(&self, task_id: u64, total_segments: u64) {
+        if self.current_task_id.load(Ordering::SeqCst) != task_id {
+            return;
+        }
+        self.current_task_total_segments
+            .store(total_segments, Ordering::SeqCst);
+        let completed = self.current_task_completed_segments.load(Ordering::SeqCst);
+        if completed > total_segments {
+            self.current_task_completed_segments
+                .store(total_segments, Ordering::SeqCst);
+        }
+    }
+
+    pub fn set_current_task_completed_segments(&self, task_id: u64, completed_segments: u64) {
+        if self.current_task_id.load(Ordering::SeqCst) != task_id {
+            return;
+        }
+        let total = self.current_task_total_segments.load(Ordering::SeqCst);
+        let bounded = if total > 0 {
+            completed_segments.min(total)
+        } else {
+            completed_segments
+        };
+        self.current_task_completed_segments
+            .store(bounded, Ordering::SeqCst);
+    }
+
+    pub fn current_task_progress(&self) -> Option<(u64, u64)> {
+        self.current_task_id().map(|_| {
+            (
+                self.current_task_completed_segments.load(Ordering::SeqCst),
+                self.current_task_total_segments.load(Ordering::SeqCst),
+            )
+        })
     }
 
     pub fn cancel_current(&self) -> Option<u64> {
@@ -230,5 +276,23 @@ mod tests {
 
         let future = control.alloc_task_id();
         assert!(!control.is_cancelled(future));
+    }
+
+    #[test]
+    fn current_task_progress_tracks_active_task_only() {
+        let control = SpeechTaskControl::new();
+        let first = control.alloc_task_id();
+        let second = control.alloc_task_id();
+
+        control.set_current_task_id(second);
+        control.set_current_task_total_segments(second, 10);
+        control.set_current_task_completed_segments(second, 3);
+        assert_eq!(control.current_task_progress(), Some((3, 10)));
+
+        control.set_current_task_completed_segments(first, 8);
+        assert_eq!(control.current_task_progress(), Some((3, 10)));
+
+        control.clear_current_task_id(second);
+        assert_eq!(control.current_task_progress(), None);
     }
 }
