@@ -9,6 +9,10 @@ pub struct ServerConfig {
     pub tts_base_model_path: Option<String>,
     /// Path to ASR model directory (ASR_MODEL_PATH)
     pub asr_model_path: Option<String>,
+    /// TTS compute device preference (TTS_DEVICE): cuda, cpu, or auto
+    pub tts_device: String,
+    /// ASR compute device preference (ASR_DEVICE): cuda, cpu, or auto
+    pub asr_device: String,
     /// Default reference audio path used when request omits audio_sample (DEFAULT_AUDIO_SAMPLE_PATH)
     pub default_audio_sample_path: Option<String>,
     /// Default transcript for the reference audio (DEFAULT_AUDIO_SAMPLE_TEXT)
@@ -34,6 +38,14 @@ impl ServerConfig {
             asr_model_path: std::env::var("ASR_MODEL_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            tts_device: std::env::var("TTS_DEVICE")
+                .unwrap_or_else(|_| "cuda".to_string())
+                .trim()
+                .to_ascii_lowercase(),
+            asr_device: std::env::var("ASR_DEVICE")
+                .unwrap_or_else(|_| "cuda".to_string())
+                .trim()
+                .to_ascii_lowercase(),
             default_audio_sample_path: std::env::var("DEFAULT_AUDIO_SAMPLE_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),

@@ -104,6 +104,8 @@ for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qw
 | `TTS_CUSTOMVOICE_MODEL_PATH` | -- | Path to CustomVoice model directory (enables `voice`/`instructions` parameters) |
 | `TTS_BASE_MODEL_PATH` | -- | Path to Base model directory (enables `audio_sample` voice cloning) |
 | `ASR_MODEL_PATH` | -- | Path to ASR model directory (enables `/v1/audio/transcriptions`) |
+| `TTS_DEVICE` | `cuda` | TTS device preference: `cuda`, `cpu`, or `auto` |
+| `ASR_DEVICE` | `cuda` | ASR device preference: `cuda`, `cpu`, or `auto` |
 | `DEFAULT_AUDIO_SAMPLE_PATH` | -- | Optional reference audio file path used when a request omits `audio_sample` (requires `TTS_BASE_MODEL_PATH`) |
 | `DEFAULT_AUDIO_SAMPLE_TEXT` | -- | Optional transcript paired with `DEFAULT_AUDIO_SAMPLE_PATH`; enables ICL mode for default voice cloning |
 | `DEFAULT_INSTRUCTIONS` | -- | Optional default speaking instructions used when requests omit `instructions` in CustomVoice mode |
@@ -119,6 +121,8 @@ At least one of `TTS_CUSTOMVOICE_MODEL_PATH`, `TTS_BASE_MODEL_PATH`, or `ASR_MOD
 TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   TTS_BASE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-Base \
   ASR_MODEL_PATH=./models/Qwen3-ASR-0.6B \
+  TTS_DEVICE=cuda \
+  ASR_DEVICE=cuda \
   DEFAULT_AUDIO_SAMPLE_PATH=./defaults/reference.wav \
   DEFAULT_AUDIO_SAMPLE_TEXT="Default reference transcript." \
   DEFAULT_INSTRUCTIONS="Please speak in a formal, serious tone suitable for speeches and news narration." \

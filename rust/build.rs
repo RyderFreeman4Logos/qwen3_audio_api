@@ -2,6 +2,12 @@ fn main() {
     #[cfg(feature = "tch-backend")]
     {
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os == "linux" {
+            // Keep CUDA-linked libtorch deps (e.g. torch_cuda) from being
+            // dropped by the linker's default as-needed behavior.
+            println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+        }
+
         if target_os == "linux" && std::env::var("LIBTORCH").is_err() {
             panic!(
                 "\n\

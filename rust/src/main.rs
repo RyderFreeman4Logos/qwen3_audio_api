@@ -38,12 +38,31 @@ async fn main() -> anyhow::Result<()> {
     // Determine TTS device based on backend
     #[cfg(feature = "tch-backend")]
     let tts_device = {
-        if tch::Cuda::is_available() {
-            tracing::info!("TTS using CUDA GPU");
-            TtsDevice::Gpu(0)
-        } else {
-            tracing::info!("TTS using CPU");
-            TtsDevice::Cpu
+        match config.tts_device.as_str() {
+            "cpu" => {
+                tracing::info!("TTS using CPU (TTS_DEVICE=cpu)");
+                TtsDevice::Cpu
+            }
+            "cuda" | "gpu" => {
+                if !tch::Cuda::is_available() {
+                    tracing::warn!(
+                        "TTS_DEVICE={} but tch reports CUDA unavailable; still forcing GPU(0)",
+                        config.tts_device
+                    );
+                } else {
+                    tracing::info!("TTS using CUDA GPU (TTS_DEVICE={})", config.tts_device);
+                }
+                TtsDevice::Gpu(0)
+            }
+            _ => {
+                if tch::Cuda::is_available() {
+                    tracing::info!("TTS using CUDA GPU (TTS_DEVICE=auto)");
+                    TtsDevice::Gpu(0)
+                } else {
+                    tracing::info!("TTS using CPU (TTS_DEVICE=auto)");
+                    TtsDevice::Cpu
+                }
+            }
         }
     };
 
@@ -135,12 +154,31 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "tch-backend")]
         let asr_device = {
-            if tch::Cuda::is_available() {
-                tracing::info!("ASR using CUDA GPU");
-                qwen3_asr::tensor::Device::Gpu(0)
-            } else {
-                tracing::info!("ASR using CPU");
-                qwen3_asr::tensor::Device::Cpu
+            match config.asr_device.as_str() {
+                "cpu" => {
+                    tracing::info!("ASR using CPU (ASR_DEVICE=cpu)");
+                    qwen3_asr::tensor::Device::Cpu
+                }
+                "cuda" | "gpu" => {
+                    if !tch::Cuda::is_available() {
+                        tracing::warn!(
+                            "ASR_DEVICE={} but tch reports CUDA unavailable; still forcing GPU(0)",
+                            config.asr_device
+                        );
+                    } else {
+                        tracing::info!("ASR using CUDA GPU (ASR_DEVICE={})", config.asr_device);
+                    }
+                    qwen3_asr::tensor::Device::Gpu(0)
+                }
+                _ => {
+                    if tch::Cuda::is_available() {
+                        tracing::info!("ASR using CUDA GPU (ASR_DEVICE=auto)");
+                        qwen3_asr::tensor::Device::Gpu(0)
+                    } else {
+                        tracing::info!("ASR using CPU (ASR_DEVICE=auto)");
+                        qwen3_asr::tensor::Device::Cpu
+                    }
+                }
             }
         };
 
