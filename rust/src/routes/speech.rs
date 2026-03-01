@@ -322,13 +322,16 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
         audio_sample,
         audio_sample_text,
     } = params;
-    let segments = split_text_for_tts(&input, state.speech_runtime.segment_max_bytes);
+    let segment_max_chars = state.speech_runtime.segment_max_chars();
+    let segments = split_text_for_tts(&input, state.speech_runtime.segment_max_bytes, segment_max_chars);
     tracing::info!(
-        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}",
+        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}, segment_max_chars={}, segment_target_max_codes={}",
         task_id,
         input.chars().count(),
         segments.len(),
-        state.speech_runtime.segment_max_bytes
+        state.speech_runtime.segment_max_bytes,
+        segment_max_chars,
+        state.speech_runtime.segment_target_max_codes
     );
 
     let (waveform, sample_rate) = tokio::task::spawn_blocking(move || {
@@ -630,78 +633,92 @@ fn append_segment_audio(
     Ok(())
 }
 
-fn split_text_for_tts(input: &str, max_bytes: usize) -> Vec<String> {
+fn split_text_for_tts(input: &str, max_bytes: usize, max_chars: usize) -> Vec<String> {
     let text = input.trim();
     if text.is_empty() {
         return Vec::new();
     }
-    if text.len() <= max_bytes {
-        return vec![text.to_string()];
-    }
 
-    let mut boundary_positions = Vec::new();
-    for (idx, ch) in text.char_indices() {
-        let next = idx + ch.len_utf8();
-        if is_preferred_boundary(ch) {
-            boundary_positions.push(next);
-        }
-    }
-    if boundary_positions.last().copied() != Some(text.len()) {
-        boundary_positions.push(text.len());
-    }
-
+    let normalized = text.replace("\r\n", "\n");
     let mut chunks = Vec::new();
-    let mut start = 0usize;
+    for paragraph in normalized
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        split_block_for_tts(paragraph, max_bytes, max_chars, &mut chunks);
+    }
 
-    while start < text.len() {
-        while start < text.len() {
-            let ch = text[start..].chars().next().unwrap_or(' ');
-            if ch.is_whitespace() {
-                start += ch.len_utf8();
+    if chunks.is_empty() {
+        vec![normalized]
+    } else {
+        chunks
+    }
+}
+
+fn split_block_for_tts(block: &str, max_bytes: usize, max_chars: usize, out: &mut Vec<String>) {
+    let mut start = 0usize;
+    while start < block.len() {
+        start = skip_whitespace(block, start);
+        if start >= block.len() {
+            return;
+        }
+
+        let hard_limit = advance_within_budget(block, start, max_bytes, max_chars);
+        let mut split = if hard_limit >= block.len() {
+            block.len()
+        } else {
+            find_last_preferred_boundary(block, start, hard_limit).unwrap_or(hard_limit)
+        };
+
+        if split <= start {
+            if let Some(ch) = block[start..].chars().next() {
+                split = start + ch.len_utf8();
             } else {
                 break;
             }
         }
-        if start >= text.len() {
-            break;
-        }
 
-        let hard_limit = (start + max_bytes).min(text.len());
-        let mut split = if hard_limit == text.len() {
-            text.len()
-        } else {
-            boundary_positions
-                .iter()
-                .rev()
-                .copied()
-                .find(|&b| b > start && b <= hard_limit)
-                .unwrap_or_else(|| {
-                    let mut boundary = hard_limit;
-                    while boundary > start && !text.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    boundary
-                })
-        };
-
-        if split <= start {
-            split = text.len().min(start + 1);
-            while split < text.len() && !text.is_char_boundary(split) {
-                split += 1;
-            }
-        }
-
-        let chunk = text[start..split].trim();
+        let chunk = block[start..split].trim();
         if !chunk.is_empty() {
-            chunks.push(chunk.to_string());
+            out.push(chunk.to_string());
         }
         start = split;
     }
+}
 
-    if chunks.is_empty() {
-        vec![text.to_string()]
+fn skip_whitespace(text: &str, mut idx: usize) -> usize {
+    while idx < text.len() {
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            idx += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    idx
+}
+
+fn advance_within_budget(text: &str, start: usize, max_bytes: usize, max_chars: usize) -> usize {
+    let mut bytes_used = 0usize;
+    let mut end = start;
+    for (chars_used, (off, ch)) in text[start..].char_indices().enumerate() {
+        let ch_bytes = ch.len_utf8();
+        if bytes_used + ch_bytes > max_bytes || chars_used + 1 > max_chars {
+            break;
+        }
+        bytes_used += ch_bytes;
+        end = start + off + ch_bytes;
+    }
+
+    if end > start {
+        end
+    } else if let Some(ch) = text[start..].chars().next() {
+        start + ch.len_utf8()
     } else {
-        chunks
+        start
     }
 }
 
@@ -720,40 +737,53 @@ fn is_preferred_boundary(ch: char) -> bool {
     )
 }
 
+fn find_last_preferred_boundary(text: &str, start: usize, hard_limit: usize) -> Option<usize> {
+    let mut last = None;
+    for (off, ch) in text[start..hard_limit].char_indices() {
+        if is_preferred_boundary(ch) {
+            last = Some(start + off + ch.len_utf8());
+        }
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::split_text_for_tts;
 
     const TEST_MAX_BYTES: usize = 4096;
+    const TEST_MAX_CHARS: usize = 300;
 
     #[test]
     fn split_text_keeps_short_input_single_segment() {
         let input = "这是短文本。";
-        let chunks = split_text_for_tts(input, TEST_MAX_BYTES);
+        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS);
         assert_eq!(chunks, vec![input.to_string()]);
     }
 
     #[test]
     fn split_text_breaks_long_chinese_input() {
         let input = "第一段。第二段！第三段？".repeat(600);
-        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
     }
 
     #[test]
     fn split_text_handles_long_unpunctuated_input() {
         let input = "啊".repeat(5000);
-        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
     }
 
     #[test]
     fn split_text_prefers_sentence_boundaries_under_limit() {
         let input = "第一段。第二段。第三段。";
-        let chunks = split_text_for_tts(input, 16);
+        let chunks = split_text_for_tts(input, 16, 16);
         assert_eq!(
             chunks,
             vec![
@@ -761,6 +791,16 @@ mod tests {
                 "第二段。".to_string(),
                 "第三段。".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn split_text_prefers_paragraph_boundaries() {
+        let input = "第一段第一句。\n\n第二段第一句。";
+        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS);
+        assert_eq!(
+            chunks,
+            vec!["第一段第一句。".to_string(), "第二段第一句。".to_string()]
         );
     }
 }

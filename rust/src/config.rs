@@ -12,6 +12,7 @@ const DEFAULT_MAX_GENERATION_CODES: i64 = 2048;
 const DEFAULT_BASE_GENERATION_CODES: i64 = 96;
 const DEFAULT_CODES_PER_CHAR: f32 = 3.8;
 const DEFAULT_VOCODER_CHUNK_CODES: i64 = 0;
+const DEFAULT_SEGMENT_TARGET_MAX_CODES: i64 = 640;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -72,6 +73,9 @@ pub struct SpeechRuntimeConfig {
     pub codes_per_char: f32,
     /// Optional hard cap for generated codes per segment (0 = disabled).
     pub vocoder_chunk_codes: i64,
+    /// Target upper budget used for text segmentation.
+    /// Keeps each segment short enough to reduce long-context degeneration.
+    pub segment_target_max_codes: i64,
     /// Enables adaptive generation budgeting (rollback: set to 0).
     pub incremental_enabled: bool,
 }
@@ -121,6 +125,10 @@ impl SpeechRuntimeConfig {
             ),
             codes_per_char: env_f32("RUST_TTS_CODES_PER_CHAR", DEFAULT_CODES_PER_CHAR),
             vocoder_chunk_codes: env_i64("RUST_TTS_VOCODER_CHUNK", DEFAULT_VOCODER_CHUNK_CODES),
+            segment_target_max_codes: env_i64(
+                "RUST_TTS_SEGMENT_TARGET_MAX_CODES",
+                DEFAULT_SEGMENT_TARGET_MAX_CODES,
+            ),
             incremental_enabled: env_bool("RUST_TTS_INCREMENTAL", true),
         };
 
@@ -163,8 +171,22 @@ impl SpeechRuntimeConfig {
         if cfg.vocoder_chunk_codes < 0 {
             return Err("RUST_TTS_VOCODER_CHUNK must be >= 0".to_string());
         }
+        if cfg.segment_target_max_codes <= 0 {
+            return Err("RUST_TTS_SEGMENT_TARGET_MAX_CODES must be > 0".to_string());
+        }
 
         Ok(cfg)
+    }
+
+    /// Derive a per-segment character budget used by text splitting.
+    /// Keeps segments inside a stable generation regime even for long articles.
+    pub fn segment_max_chars(&self) -> usize {
+        let target_codes = self
+            .segment_target_max_codes
+            .clamp(self.min_generation_codes, self.max_generation_codes);
+        let available = target_codes.saturating_sub(self.base_generation_codes).max(1) as f32;
+        let estimated = (available / self.codes_per_char).floor() as usize;
+        estimated.max(32)
     }
 
     pub fn estimate_segment_max_codes(&self, input: &str) -> i64 {
