@@ -45,7 +45,7 @@ ffmpeg-next = "8"
 # Qwen3 inference crates (git dependencies)
 # Use local fork commit that keeps checkpoint BF16 weights on GPU to avoid
 # forced Float32 expansion and CUDA OOM on 8GB cards with 1.7B Base.
-qwen3_tts = { git = "https://github.com/RyderFreeman4Logos/qwen3_tts_rs.git", rev = "af893609ee69baa53a474f1aa8ecb18b4e4bac9c", default-features = false }
+qwen3_tts = { git = "https://github.com/RyderFreeman4Logos/qwen3_tts_rs.git", rev = "a394c58b698ed26308dbed104fc7e056d170447f", default-features = false }
 qwen3_asr = { git = "https://github.com/second-state/qwen3_asr_rs.git", default-features = false }
 
 # PyTorch bindings (optional, only for tch-backend CUDA detection)

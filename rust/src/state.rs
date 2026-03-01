@@ -172,7 +172,7 @@ pub fn new_app_state(models: Models, speech_runtime: SpeechRuntimeConfig) -> App
 
 #[cfg(test)]
 mod tests {
-    use super::{new_app_state, Models};
+    use super::{new_app_state, Models, SpeechTaskControl};
     use crate::config::SpeechRuntimeConfig;
 
     fn empty_models() -> Models {
@@ -203,5 +203,32 @@ mod tests {
 
         let guard = state.lock_models_recover();
         assert!(guard.custom_voice.is_none());
+    }
+
+    #[test]
+    fn cancel_current_cancels_up_to_active_task_boundary() {
+        let control = SpeechTaskControl::new();
+        let first = control.alloc_task_id();
+        let second = control.alloc_task_id();
+        control.set_current_task_id(second);
+
+        assert_eq!(control.cancel_current(), Some(second));
+        assert!(control.is_cancelled(first));
+        assert!(control.is_cancelled(second));
+        assert!(!control.is_cancelled(second + 1));
+    }
+
+    #[test]
+    fn cancel_all_does_not_kill_future_tasks() {
+        let control = SpeechTaskControl::new();
+        let _ = control.alloc_task_id();
+        let second = control.alloc_task_id();
+
+        let cancelled_up_to = control.cancel_all();
+        assert_eq!(cancelled_up_to, second);
+        assert!(control.is_cancelled(second));
+
+        let future = control.alloc_task_id();
+        assert!(!control.is_cancelled(future));
     }
 }
