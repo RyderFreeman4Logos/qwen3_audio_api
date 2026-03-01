@@ -323,15 +323,21 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
         audio_sample_text,
     } = params;
     let segment_max_chars = state.speech_runtime.segment_max_chars();
-    let segments = split_text_for_tts(&input, state.speech_runtime.segment_max_bytes, segment_max_chars);
+    let segments = split_text_for_tts(
+        &input,
+        state.speech_runtime.segment_max_bytes,
+        segment_max_chars,
+        state.speech_runtime.segment_break_on_commas,
+    );
     tracing::info!(
-        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}, segment_max_chars={}, segment_target_max_codes={}",
+        "speech task {} accepted: input_chars={}, segments={}, segment_max_bytes={}, segment_max_chars={}, segment_target_max_codes={}, split_on_commas={}",
         task_id,
         input.chars().count(),
         segments.len(),
         state.speech_runtime.segment_max_bytes,
         segment_max_chars,
-        state.speech_runtime.segment_target_max_codes
+        state.speech_runtime.segment_target_max_codes,
+        state.speech_runtime.segment_break_on_commas
     );
 
     let (waveform, sample_rate) = tokio::task::spawn_blocking(move || {
@@ -633,7 +639,12 @@ fn append_segment_audio(
     Ok(())
 }
 
-fn split_text_for_tts(input: &str, max_bytes: usize, max_chars: usize) -> Vec<String> {
+fn split_text_for_tts(
+    input: &str,
+    max_bytes: usize,
+    max_chars: usize,
+    split_on_commas: bool,
+) -> Vec<String> {
     let text = input.trim();
     if text.is_empty() {
         return Vec::new();
@@ -646,7 +657,7 @@ fn split_text_for_tts(input: &str, max_bytes: usize, max_chars: usize) -> Vec<St
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        split_block_for_tts(paragraph, max_bytes, max_chars, &mut chunks);
+        split_block_for_tts(paragraph, max_bytes, max_chars, split_on_commas, &mut chunks);
     }
 
     if chunks.is_empty() {
@@ -656,7 +667,13 @@ fn split_text_for_tts(input: &str, max_bytes: usize, max_chars: usize) -> Vec<St
     }
 }
 
-fn split_block_for_tts(block: &str, max_bytes: usize, max_chars: usize, out: &mut Vec<String>) {
+fn split_block_for_tts(
+    block: &str,
+    max_bytes: usize,
+    max_chars: usize,
+    split_on_commas: bool,
+    out: &mut Vec<String>,
+) {
     let mut start = 0usize;
     while start < block.len() {
         start = skip_whitespace(block, start);
@@ -668,7 +685,8 @@ fn split_block_for_tts(block: &str, max_bytes: usize, max_chars: usize, out: &mu
         let mut split = if hard_limit >= block.len() {
             block.len()
         } else {
-            find_last_preferred_boundary(block, start, hard_limit).unwrap_or(hard_limit)
+            find_last_preferred_boundary(block, start, hard_limit, split_on_commas)
+                .unwrap_or(hard_limit)
         };
 
         if split <= start {
@@ -722,7 +740,7 @@ fn advance_within_budget(text: &str, start: usize, max_bytes: usize, max_chars: 
     }
 }
 
-fn is_preferred_boundary(ch: char) -> bool {
+fn is_preferred_boundary(ch: char, split_on_commas: bool) -> bool {
     matches!(
         ch,
         '\n' | '\r'
@@ -734,13 +752,18 @@ fn is_preferred_boundary(ch: char) -> bool {
             | '!'
             | '?'
             | ';'
-    )
+    ) || (split_on_commas && matches!(ch, '，' | ',' | '、'))
 }
 
-fn find_last_preferred_boundary(text: &str, start: usize, hard_limit: usize) -> Option<usize> {
+fn find_last_preferred_boundary(
+    text: &str,
+    start: usize,
+    hard_limit: usize,
+    split_on_commas: bool,
+) -> Option<usize> {
     let mut last = None;
     for (off, ch) in text[start..hard_limit].char_indices() {
-        if is_preferred_boundary(ch) {
+        if is_preferred_boundary(ch, split_on_commas) {
             last = Some(start + off + ch.len_utf8());
         }
     }
@@ -757,14 +780,14 @@ mod tests {
     #[test]
     fn split_text_keeps_short_input_single_segment() {
         let input = "这是短文本。";
-        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS);
+        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS, false);
         assert_eq!(chunks, vec![input.to_string()]);
     }
 
     #[test]
     fn split_text_breaks_long_chinese_input() {
         let input = "第一段。第二段！第三段？".repeat(600);
-        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS, false);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
@@ -774,7 +797,7 @@ mod tests {
     #[test]
     fn split_text_handles_long_unpunctuated_input() {
         let input = "啊".repeat(5000);
-        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS);
+        let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS, false);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
@@ -783,7 +806,7 @@ mod tests {
     #[test]
     fn split_text_prefers_sentence_boundaries_under_limit() {
         let input = "第一段。第二段。第三段。";
-        let chunks = split_text_for_tts(input, 16, 16);
+        let chunks = split_text_for_tts(input, 16, 16, false);
         assert_eq!(
             chunks,
             vec![
@@ -797,10 +820,24 @@ mod tests {
     #[test]
     fn split_text_prefers_paragraph_boundaries() {
         let input = "第一段第一句。\n\n第二段第一句。";
-        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS);
+        let chunks = split_text_for_tts(input, TEST_MAX_BYTES, TEST_MAX_CHARS, false);
         assert_eq!(
             chunks,
             vec!["第一段第一句。".to_string(), "第二段第一句。".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_text_can_break_on_commas_when_enabled() {
+        let input = "第一句，第二句，第三句";
+        let chunks = split_text_for_tts(input, 16, 4, true);
+        assert_eq!(
+            chunks,
+            vec![
+                "第一句，".to_string(),
+                "第二句，".to_string(),
+                "第三句".to_string()
+            ]
         );
     }
 }

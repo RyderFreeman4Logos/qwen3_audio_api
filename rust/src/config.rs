@@ -13,6 +13,7 @@ const DEFAULT_BASE_GENERATION_CODES: i64 = 96;
 const DEFAULT_CODES_PER_CHAR: f32 = 3.8;
 const DEFAULT_VOCODER_CHUNK_CODES: i64 = 0;
 const DEFAULT_SEGMENT_TARGET_MAX_CODES: i64 = 640;
+const DEFAULT_SEGMENT_BREAK_ON_COMMAS: bool = false;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -76,6 +77,8 @@ pub struct SpeechRuntimeConfig {
     /// Target upper budget used for text segmentation.
     /// Keeps each segment short enough to reduce long-context degeneration.
     pub segment_target_max_codes: i64,
+    /// Enables comma-level split points for conservative long-text synthesis.
+    pub segment_break_on_commas: bool,
     /// Enables adaptive generation budgeting (rollback: set to 0).
     pub incremental_enabled: bool,
 }
@@ -128,6 +131,10 @@ impl SpeechRuntimeConfig {
             segment_target_max_codes: env_i64(
                 "RUST_TTS_SEGMENT_TARGET_MAX_CODES",
                 DEFAULT_SEGMENT_TARGET_MAX_CODES,
+            ),
+            segment_break_on_commas: env_bool(
+                "RUST_TTS_SEGMENT_BREAK_ON_COMMAS",
+                DEFAULT_SEGMENT_BREAK_ON_COMMAS,
             ),
             incremental_enabled: env_bool("RUST_TTS_INCREMENTAL", true),
         };
