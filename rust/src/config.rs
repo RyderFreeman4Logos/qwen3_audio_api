@@ -21,7 +21,7 @@ pub struct ServerConfig {
     pub default_instructions: Option<String>,
     /// Bind address (HOST, default: 0.0.0.0)
     pub host: String,
-    /// Port (PORT, default: 8000)
+    /// Port (PORT, default: 38317)
     pub port: u16,
 }
 
@@ -59,7 +59,7 @@ impl ServerConfig {
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8000),
+                .unwrap_or(38317),
         };
 
         if config.tts_customvoice_model_path.is_none()

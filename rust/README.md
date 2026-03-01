@@ -110,7 +110,7 @@ for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qw
 | `DEFAULT_AUDIO_SAMPLE_TEXT` | -- | Optional transcript paired with `DEFAULT_AUDIO_SAMPLE_PATH`; enables ICL mode for default voice cloning |
 | `DEFAULT_INSTRUCTIONS` | -- | Optional default speaking instructions used when requests omit `instructions` in CustomVoice mode |
 | `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `8000` | Server port |
+| `PORT` | `38317` | Server port |
 | `RUST_LOG` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
 
 At least one of `TTS_CUSTOMVOICE_MODEL_PATH`, `TTS_BASE_MODEL_PATH`, or `ASR_MODEL_PATH` must be set.
@@ -160,7 +160,7 @@ Generate speech from text. Compatible with the [OpenAI audio speech API](https:/
 **Example — predefined voice (CustomVoice model):**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:38317/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-tts",
@@ -175,7 +175,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 **Example — voice cloning (Base model):**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:38317/v1/audio/speech \
   -F model=qwen3-tts \
   -F "input=This sentence will be spoken in the cloned voice." \
   -F audio_sample=@reference.wav \
@@ -211,7 +211,7 @@ Transcribe audio to text. Compatible with the [OpenAI audio transcriptions API](
 **Example:**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/transcriptions \
+curl -X POST http://localhost:38317/v1/audio/transcriptions \
   -F file=@audio.wav \
   -F model=qwen3-asr
 ```
@@ -219,7 +219,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 **Example with language hint:**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/transcriptions \
+curl -X POST http://localhost:38317/v1/audio/transcriptions \
   -F file=@audio.wav \
   -F model=qwen3-asr \
   -F language=English \
@@ -231,7 +231,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 Returns the list of available models.
 
 ```bash
-curl http://localhost:8000/v1/models
+curl http://localhost:38317/v1/models
 ```
 
 ### `GET /health`
@@ -239,7 +239,7 @@ curl http://localhost:8000/v1/models
 Returns `{"status": "ok"}` when the server is ready.
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:38317/health
 ```
 
 ## Voices
