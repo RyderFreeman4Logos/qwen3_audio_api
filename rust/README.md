@@ -140,7 +140,7 @@ Generate speech from text. Compatible with the [OpenAI audio speech API](https:/
 | Field | Type | Required | Default | Description | Requires model |
 |-------|------|----------|---------|-------------|----------------|
 | `model` | string | yes | -- | Model identifier (accepted for compatibility; the loaded model is always used) | -- |
-| `input` | string | yes | -- | Text to synthesize (max 4096 characters) | -- |
+| `input` | string | yes | -- | Text to synthesize (auto-split into model-safe segments and merged in order) | -- |
 | `voice` | string | no | `alloy` | Voice name (see table below) | CustomVoice |
 | `response_format` | string | no | `mp3` | `mp3`, `opus`, `aac`, `flac`, `wav`, or `pcm` | -- |
 | `speed` | number | no | `1.0` | Playback speed, `0.25` to `4.0` | -- |
@@ -150,6 +150,8 @@ Generate speech from text. Compatible with the [OpenAI audio speech API](https:/
 | `audio_sample_text` | string | no | -- | Transcript of the reference audio; enables in-context learning mode for higher quality cloning | Base |
 
 > **Note:** The endpoint accepts both JSON and multipart/form-data. Use multipart (`curl -F`) to upload `audio_sample` as a binary file — this avoids base64 encoding. JSON requests can pass `audio_sample` as a base64-encoded string.
+>
+> Long input text is automatically split by punctuation/newlines into model-safe chunks (with fallback hard splits for very long unpunctuated text), synthesized sequentially, and merged with short pauses.
 >
 > When `audio_sample` is provided the request uses the **Base** model for voice cloning and `voice`/`instructions` are ignored. When `audio_sample` is omitted, the server first checks `DEFAULT_AUDIO_SAMPLE_PATH`; if configured, it performs default voice cloning with that reference audio (and optional `DEFAULT_AUDIO_SAMPLE_TEXT`). If no default sample is configured, it uses the **CustomVoice** model and requires a valid `voice`. If the required model is not loaded the server returns HTTP 400.
 >
@@ -184,6 +186,25 @@ curl -X POST http://localhost:38317/v1/audio/speech \
   -F response_format=wav \
   --output cloned.wav
 ```
+
+### `POST /v1/audio/speech/cancel-current`
+
+Request cancellation for the currently running speech task.
+
+```bash
+curl -X POST http://localhost:38317/v1/audio/speech/cancel-current
+```
+
+### `POST /v1/audio/speech/cancel-all`
+
+Request cancellation for all running/queued speech tasks currently known to the server.
+
+```bash
+curl -X POST http://localhost:38317/v1/audio/speech/cancel-all
+```
+
+> Cancellation is cooperative: the server checks cancellation between synthesized segments.  
+> If the model is currently inside one segment generation call, cancellation takes effect at the next segment boundary.
 
 ### `POST /v1/audio/transcriptions`
 

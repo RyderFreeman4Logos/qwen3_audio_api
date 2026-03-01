@@ -201,6 +201,14 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/v1/audio/speech", post(routes::speech::speech_handler))
         .route(
+            "/v1/audio/speech/cancel-current",
+            post(routes::speech::cancel_current_handler),
+        )
+        .route(
+            "/v1/audio/speech/cancel-all",
+            post(routes::speech::cancel_all_handler),
+        )
+        .route(
             "/v1/audio/transcriptions",
             post(routes::transcription::transcribe),
         )

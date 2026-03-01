@@ -95,6 +95,7 @@ pub async fn transcribe(
     let wav_path_str = wav_path.clone();
     let text = tokio::task::spawn_blocking(move || {
         let models = state
+            .models
             .lock()
             .map_err(|e| ApiError::internal(e.to_string()))?;
         let asr = models.asr.as_ref().ok_or_else(|| {
