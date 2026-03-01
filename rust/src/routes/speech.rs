@@ -84,11 +84,11 @@ pub async fn speech_handler(
         })?;
         speech_multipart(state, multipart).await
     } else {
-        let bytes = Bytes::from_request(request, &())
-            .await
-            .map_err(|e: axum::extract::rejection::BytesRejection| {
+        let bytes = Bytes::from_request(request, &()).await.map_err(
+            |e: axum::extract::rejection::BytesRejection| {
                 ApiError::unprocessable(format!("Failed to read request body: {e}"))
-            })?;
+            },
+        )?;
         let req: SpeechRequest = serde_json::from_slice(&bytes)
             .map_err(|e| ApiError::unprocessable(format!("Invalid JSON: {e}")))?;
         speech_json(state, req).await
@@ -112,10 +112,7 @@ async fn speech_json(state: AppState, req: SpeechRequest) -> Result<Response, Ap
     generate_speech(state, params).await
 }
 
-async fn speech_multipart(
-    state: AppState,
-    mut multipart: Multipart,
-) -> Result<Response, ApiError> {
+async fn speech_multipart(state: AppState, mut multipart: Multipart) -> Result<Response, ApiError> {
     let mut input: Option<String> = None;
     let mut voice = "alloy".to_string();
     let mut response_format = ResponseFormat::Mp3;
@@ -240,7 +237,19 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
     let (waveform, sample_rate) = tokio::task::spawn_blocking(move || {
         let models = state.lock().map_err(|e| ApiError::internal(e.to_string()))?;
 
-        if let Some(audio_data) = params.audio_sample {
+        let mut effective_audio_sample = params.audio_sample;
+        let mut effective_audio_sample_text = params.audio_sample_text;
+
+        if effective_audio_sample.is_none() {
+            if let Some(default_audio_bytes) = models.default_audio_sample_wav_bytes.as_ref() {
+                effective_audio_sample = Some(AudioSampleData::Bytes(default_audio_bytes.clone()));
+                if effective_audio_sample_text.is_none() {
+                    effective_audio_sample_text = models.default_audio_sample_text.clone();
+                }
+            }
+        }
+
+        if let Some(audio_data) = effective_audio_sample {
             // Voice cloning path
             let base_model = models.base_model.as_ref().ok_or_else(|| {
                 ApiError::bad_request(
@@ -280,7 +289,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                 .extract_embedding(&ref_samples_24k)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
 
-            let use_icl = params.audio_sample_text.is_some();
+            let use_icl = effective_audio_sample_text.is_some();
 
             if use_icl {
                 // ICL mode: encode reference audio to codec tokens
@@ -297,7 +306,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                 base_model
                     .generate_with_icl(
                         &params.input,
-                        params.audio_sample_text.as_deref().unwrap(),
+                        effective_audio_sample_text.as_deref().unwrap(),
                         &ref_codes,
                         &speaker_embedding,
                         &params.language,
@@ -332,7 +341,11 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
             let speaker_name =
                 resolve_voice(&params.voice).map_err(ApiError::bad_request)?;
 
-            let instruct = params.instructions.as_deref().unwrap_or("");
+            let instruct = params
+                .instructions
+                .as_deref()
+                .or(models.default_instructions.as_deref())
+                .unwrap_or("");
 
             model
                 .generate_with_instruct(

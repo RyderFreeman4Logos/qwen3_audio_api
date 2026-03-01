@@ -9,6 +9,12 @@ pub struct ServerConfig {
     pub tts_base_model_path: Option<String>,
     /// Path to ASR model directory (ASR_MODEL_PATH)
     pub asr_model_path: Option<String>,
+    /// Default reference audio path used when request omits audio_sample (DEFAULT_AUDIO_SAMPLE_PATH)
+    pub default_audio_sample_path: Option<String>,
+    /// Default transcript for the reference audio (DEFAULT_AUDIO_SAMPLE_TEXT)
+    pub default_audio_sample_text: Option<String>,
+    /// Default speaking instructions used when request omits instructions (DEFAULT_INSTRUCTIONS)
+    pub default_instructions: Option<String>,
     /// Bind address (HOST, default: 0.0.0.0)
     pub host: String,
     /// Port (PORT, default: 8000)
@@ -28,6 +34,15 @@ impl ServerConfig {
             asr_model_path: std::env::var("ASR_MODEL_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            default_audio_sample_path: std::env::var("DEFAULT_AUDIO_SAMPLE_PATH")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            default_audio_sample_text: std::env::var("DEFAULT_AUDIO_SAMPLE_TEXT")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            default_instructions: std::env::var("DEFAULT_INSTRUCTIONS")
+                .ok()
+                .filter(|s| !s.is_empty()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: std::env::var("PORT")
                 .ok()
@@ -42,6 +57,14 @@ impl ServerConfig {
             return Err(
                 "At least one of TTS_CUSTOMVOICE_MODEL_PATH, TTS_BASE_MODEL_PATH, \
                  or ASR_MODEL_PATH must be set."
+                    .to_string(),
+            );
+        }
+
+        if config.default_audio_sample_path.is_some() && config.tts_base_model_path.is_none() {
+            return Err(
+                "DEFAULT_AUDIO_SAMPLE_PATH requires TTS_BASE_MODEL_PATH because default \
+                 voice cloning uses the Base model."
                     .to_string(),
             );
         }
@@ -72,15 +95,7 @@ fn voice_map() -> HashMap<&'static str, &'static str> {
 /// Valid Qwen3-TTS speaker names.
 fn qwen_speakers() -> HashSet<&'static str> {
     HashSet::from([
-        "Vivian",
-        "Serena",
-        "Uncle_Fu",
-        "Dylan",
-        "Eric",
-        "Ryan",
-        "Aiden",
-        "Ono_Anna",
-        "Sohee",
+        "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee",
     ])
 }
 

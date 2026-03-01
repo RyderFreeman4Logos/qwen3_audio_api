@@ -17,6 +17,12 @@ pub struct Models {
     pub audio_encoder: Option<AudioEncoder>,
     /// ASR model
     pub asr: Option<AsrInference>,
+    /// Optional default reference audio bytes in WAV format.
+    pub default_audio_sample_wav_bytes: Option<Vec<u8>>,
+    /// Optional transcript paired with the default reference audio.
+    pub default_audio_sample_text: Option<String>,
+    /// Optional default speaking instructions for CustomVoice requests.
+    pub default_instructions: Option<String>,
 }
 
 /// Shared application state threaded through all handlers.

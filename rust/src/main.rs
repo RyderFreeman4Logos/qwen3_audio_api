@@ -61,7 +61,37 @@ async fn main() -> anyhow::Result<()> {
         speaker_encoder: None,
         audio_encoder: None,
         asr: None,
+        default_audio_sample_wav_bytes: None,
+        default_audio_sample_text: config.default_audio_sample_text.clone(),
+        default_instructions: config.default_instructions.clone(),
     };
+
+    if let Some(ref path) = config.default_audio_sample_path {
+        tracing::info!("Loading default reference audio from {}", path);
+        let audio_bytes =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path, e))?;
+        let suffix = Path::new(path)
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
+            .unwrap_or_else(|| ".wav".to_string());
+
+        let wav_bytes = if suffix.eq_ignore_ascii_case(".wav") {
+            audio_bytes
+        } else {
+            audio::convert_audio_to_wav_bytes(&audio_bytes, &suffix, 24000)
+                .map_err(|e| anyhow::anyhow!("Failed to convert default audio to WAV: {}", e))?
+        };
+
+        models.default_audio_sample_wav_bytes = Some(wav_bytes);
+
+        if models.default_audio_sample_text.is_some() {
+            tracing::info!("Default voice cloning will run in ICL mode");
+        } else {
+            tracing::warn!(
+                "DEFAULT_AUDIO_SAMPLE_TEXT is not set; default voice cloning will use x-vector mode"
+            );
+        }
+    }
 
     if let Some(ref path) = config.tts_customvoice_model_path {
         tracing::info!("Loading CustomVoice TTS model from {}", path);
@@ -76,8 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Load speaker encoder from base model weights
         let se_config = inference.config().speaker_encoder_config.clone();
-        let speaker_encoder =
-            SpeakerEncoder::load(inference.weights(), &se_config, tts_device)?;
+        let speaker_encoder = SpeakerEncoder::load(inference.weights(), &se_config, tts_device)?;
         tracing::info!("Speaker encoder loaded");
 
         // Load audio encoder for ICL voice cloning (if speech_tokenizer exists)

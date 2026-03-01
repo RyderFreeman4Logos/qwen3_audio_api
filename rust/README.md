@@ -104,6 +104,9 @@ for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qw
 | `TTS_CUSTOMVOICE_MODEL_PATH` | -- | Path to CustomVoice model directory (enables `voice`/`instructions` parameters) |
 | `TTS_BASE_MODEL_PATH` | -- | Path to Base model directory (enables `audio_sample` voice cloning) |
 | `ASR_MODEL_PATH` | -- | Path to ASR model directory (enables `/v1/audio/transcriptions`) |
+| `DEFAULT_AUDIO_SAMPLE_PATH` | -- | Optional reference audio file path used when a request omits `audio_sample` (requires `TTS_BASE_MODEL_PATH`) |
+| `DEFAULT_AUDIO_SAMPLE_TEXT` | -- | Optional transcript paired with `DEFAULT_AUDIO_SAMPLE_PATH`; enables ICL mode for default voice cloning |
+| `DEFAULT_INSTRUCTIONS` | -- | Optional default speaking instructions used when requests omit `instructions` in CustomVoice mode |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `8000` | Server port |
 | `RUST_LOG` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
@@ -116,6 +119,9 @@ At least one of `TTS_CUSTOMVOICE_MODEL_PATH`, `TTS_BASE_MODEL_PATH`, or `ASR_MOD
 TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   TTS_BASE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-Base \
   ASR_MODEL_PATH=./models/Qwen3-ASR-0.6B \
+  DEFAULT_AUDIO_SAMPLE_PATH=./defaults/reference.wav \
+  DEFAULT_AUDIO_SAMPLE_TEXT="Default reference transcript." \
+  DEFAULT_INSTRUCTIONS="Please speak in a formal, serious tone suitable for speeches and news narration." \
   ./qwen3-audio-api
 ```
 
@@ -141,7 +147,9 @@ Generate speech from text. Compatible with the [OpenAI audio speech API](https:/
 
 > **Note:** The endpoint accepts both JSON and multipart/form-data. Use multipart (`curl -F`) to upload `audio_sample` as a binary file — this avoids base64 encoding. JSON requests can pass `audio_sample` as a base64-encoded string.
 >
-> When `audio_sample` is provided the request uses the **Base** model for voice cloning and `voice`/`instructions` are ignored. When `audio_sample` is omitted the request uses the **CustomVoice** model and requires a valid `voice`. If the required model is not loaded the server returns HTTP 400.
+> When `audio_sample` is provided the request uses the **Base** model for voice cloning and `voice`/`instructions` are ignored. When `audio_sample` is omitted, the server first checks `DEFAULT_AUDIO_SAMPLE_PATH`; if configured, it performs default voice cloning with that reference audio (and optional `DEFAULT_AUDIO_SAMPLE_TEXT`). If no default sample is configured, it uses the **CustomVoice** model and requires a valid `voice`. If the required model is not loaded the server returns HTTP 400.
+>
+> `DEFAULT_INSTRUCTIONS` applies only when the request is handled in **CustomVoice** mode.
 
 **Response:** The raw audio bytes with the appropriate `Content-Type` header.
 
