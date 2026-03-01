@@ -1482,7 +1482,7 @@ dependencies = [
 [[package]]
 name = "qwen3_tts"
 version = "0.1.1"
-source = "git+https://github.com/second-state/qwen3_tts_rs.git#2c56ffcc0373e2a801f6c02700664a6039080f4d"
+source = "git+https://github.com/RyderFreeman4Logos/qwen3_tts_rs.git?rev=2d4d2a5e52827ffe8e92cccce0acac6faee0731e#2d4d2a5e52827ffe8e92cccce0acac6faee0731e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
