@@ -405,9 +405,17 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                     .encode(&ref_samples_24k)
                     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-                for segment in &segments {
+                for (segment_idx, segment) in segments.iter().enumerate() {
                     ensure_task_not_cancelled(&state, task_id)?;
                     let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
+                    tracing::info!(
+                        "speech task {} segment {}/{}: chars={}, max_codes={}",
+                        task_id,
+                        segment_idx + 1,
+                        segments.len(),
+                        segment.chars().count(),
+                        max_codes
+                    );
                     let (segment_waveform, segment_sample_rate) = base_model
                         .generate_with_icl(
                             segment,
@@ -430,9 +438,17 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                 }
             } else {
                 // X-vector only mode
-                for segment in &segments {
+                for (segment_idx, segment) in segments.iter().enumerate() {
                     ensure_task_not_cancelled(&state, task_id)?;
                     let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
+                    tracing::info!(
+                        "speech task {} segment {}/{}: chars={}, max_codes={}",
+                        task_id,
+                        segment_idx + 1,
+                        segments.len(),
+                        segment.chars().count(),
+                        max_codes
+                    );
                     let (segment_waveform, segment_sample_rate) = base_model
                         .generate_with_xvector(
                             segment,
@@ -472,9 +488,17 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
 
             let mut merged_waveform = Vec::new();
             let mut merged_sample_rate = None;
-            for segment in &segments {
+            for (segment_idx, segment) in segments.iter().enumerate() {
                 ensure_task_not_cancelled(&state, task_id)?;
                 let max_codes = state.speech_runtime.estimate_segment_max_codes(segment);
+                tracing::info!(
+                    "speech task {} segment {}/{}: chars={}, max_codes={}",
+                    task_id,
+                    segment_idx + 1,
+                    segments.len(),
+                    segment.chars().count(),
+                    max_codes
+                );
                 let (segment_waveform, segment_sample_rate) = model
                     .generate_with_instruct(
                         segment,
@@ -689,15 +713,10 @@ fn is_preferred_boundary(ch: char) -> bool {
             | '！'
             | '？'
             | '；'
-            | '，'
-            | '、'
-            | '：'
             | '.'
             | '!'
             | '?'
             | ';'
-            | ','
-            | ':'
     )
 }
 

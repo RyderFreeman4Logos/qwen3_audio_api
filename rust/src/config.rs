@@ -173,15 +173,11 @@ impl SpeechRuntimeConfig {
         }
 
         let chars = input.chars().count() as f32;
-        let estimated = ((chars * self.codes_per_char).ceil() as i64 + self.base_generation_codes)
+        // Generation budget should be derived from text length and explicit min/max bounds.
+        // `vocoder_chunk_codes` controls decode chunking only and must not truncate generation.
+        ((chars * self.codes_per_char).ceil() as i64 + self.base_generation_codes)
             .max(self.min_generation_codes)
-            .min(self.max_generation_codes);
-
-        if self.vocoder_chunk_codes > 0 {
-            estimated.min(self.vocoder_chunk_codes.max(self.min_generation_codes))
-        } else {
-            estimated
-        }
+            .min(self.max_generation_codes)
     }
 }
 
