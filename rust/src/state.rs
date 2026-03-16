@@ -5,6 +5,7 @@ use qwen3_asr::inference::AsrInference;
 use qwen3_tts::audio_encoder::AudioEncoder;
 use qwen3_tts::inference::TTSInference;
 use qwen3_tts::speaker_encoder::SpeakerEncoder;
+use qwen3_tts::tensor::Tensor;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::config::SpeechRuntimeConfig;
@@ -25,6 +26,12 @@ pub struct Models {
     pub default_audio_sample_wav_bytes: Option<Vec<u8>>,
     /// Optional transcript paired with the default reference audio.
     pub default_audio_sample_text: Option<String>,
+    /// Optional precomputed speaker embedding derived from the default reference audio.
+    /// Reused to avoid per-request speaker encoder inference.
+    pub default_audio_sample_speaker_embedding: Option<Tensor>,
+    /// Optional precomputed ICL reference codes derived from the default reference audio.
+    /// Reused when default voice cloning runs with `audio_sample_text`.
+    pub default_audio_sample_ref_codes: Option<Vec<Vec<i64>>>,
     /// Optional default speaking instructions for CustomVoice requests.
     pub default_instructions: Option<String>,
 }
@@ -230,6 +237,8 @@ mod tests {
             asr: None,
             default_audio_sample_wav_bytes: None,
             default_audio_sample_text: None,
+            default_audio_sample_speaker_embedding: None,
+            default_audio_sample_ref_codes: None,
             default_instructions: None,
         }
     }

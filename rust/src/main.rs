@@ -20,6 +20,54 @@ use qwen3_tts::inference::TTSInference;
 use qwen3_tts::speaker_encoder::SpeakerEncoder;
 use qwen3_tts::tensor::Device as TtsDevice;
 
+fn precompute_default_voice_clone_artifacts(models: &mut Models) -> anyhow::Result<()> {
+    let Some(wav_bytes) = models.default_audio_sample_wav_bytes.as_ref() else {
+        return Ok(());
+    };
+    let Some(speaker_encoder) = models.speaker_encoder.as_ref() else {
+        tracing::debug!(
+            "Skipping default voice-clone precompute: speaker encoder is unavailable (base model not loaded)"
+        );
+        return Ok(());
+    };
+
+    let (ref_samples, ref_sr) = qwen3_tts::audio::load_wav_bytes(wav_bytes)
+        .map_err(|e| anyhow::anyhow!("failed to decode default reference WAV: {e}"))?;
+    let ref_samples_24k = if ref_sr != 24000 {
+        qwen3_tts::audio::resample(&ref_samples, ref_sr, 24000)
+            .map_err(|e| anyhow::anyhow!("failed to resample default reference audio: {e}"))?
+    } else {
+        ref_samples
+    };
+
+    let speaker_embedding = speaker_encoder
+        .extract_embedding(&ref_samples_24k)
+        .map_err(|e| anyhow::anyhow!("failed to extract default speaker embedding: {e}"))?;
+    models.default_audio_sample_speaker_embedding = Some(speaker_embedding);
+    tracing::info!("Precomputed default speaker embedding for voice cloning");
+
+    if models.default_audio_sample_text.is_some() {
+        if let Some(audio_encoder) = models.audio_encoder.as_ref() {
+            let ref_codes = audio_encoder.encode(&ref_samples_24k).map_err(|e| {
+                anyhow::anyhow!("failed to encode default ICL reference codes: {e}")
+            })?;
+            tracing::info!(
+                "Precomputed default ICL reference codes: {} frames",
+                ref_codes.len()
+            );
+            models.default_audio_sample_ref_codes = Some(ref_codes);
+        } else {
+            tracing::warn!(
+                "DEFAULT_AUDIO_SAMPLE_TEXT is set, but audio encoder is unavailable; \
+                 default voice cloning will fall back to x-vector mode"
+            );
+            models.default_audio_sample_ref_codes = None;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env file if present (silently ignored if missing)
@@ -82,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
         asr: None,
         default_audio_sample_wav_bytes: None,
         default_audio_sample_text: config.default_audio_sample_text.clone(),
+        default_audio_sample_speaker_embedding: None,
+        default_audio_sample_ref_codes: None,
         default_instructions: config.default_instructions.clone(),
     };
 
@@ -146,6 +196,16 @@ async fn main() -> anyhow::Result<()> {
         models.speaker_encoder = Some(speaker_encoder);
         models.base_model = Some(inference);
         tracing::info!("Base TTS model loaded successfully");
+    }
+
+    if models.default_audio_sample_wav_bytes.is_some() {
+        if let Err(err) = precompute_default_voice_clone_artifacts(&mut models) {
+            tracing::warn!(
+                "Failed to precompute default voice cloning artifacts; \
+                 requests will compute on-demand: {}",
+                err
+            );
+        }
     }
 
     if let Some(ref path) = config.asr_model_path {

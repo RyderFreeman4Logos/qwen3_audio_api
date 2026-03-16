@@ -373,9 +373,24 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
 
         let mut effective_audio_sample = audio_sample;
         let mut effective_audio_sample_text = audio_sample_text;
+        let mut speaker_embedding: Option<qwen3_tts::tensor::Tensor> = None;
+        let mut icl_ref_codes: Option<Vec<Vec<i64>>> = None;
 
         if effective_audio_sample.is_none() {
-            if let Some(default_audio_bytes) = models.default_audio_sample_wav_bytes.as_ref() {
+            if let Some(default_embedding) = models.default_audio_sample_speaker_embedding.as_ref() {
+                tracing::debug!("speech task {} using precomputed default speaker embedding", task_id);
+                speaker_embedding = Some(default_embedding.shallow_clone());
+                if effective_audio_sample_text.is_none() {
+                    effective_audio_sample_text = models.default_audio_sample_text.clone();
+                }
+                if effective_audio_sample_text.is_some() {
+                    icl_ref_codes = models.default_audio_sample_ref_codes.clone();
+                }
+            } else if let Some(default_audio_bytes) = models.default_audio_sample_wav_bytes.as_ref() {
+                tracing::debug!(
+                    "speech task {} default clone cache unavailable, falling back to on-demand reference decode",
+                    task_id
+                );
                 effective_audio_sample = Some(AudioSampleData::Bytes(default_audio_bytes.clone()));
                 if effective_audio_sample_text.is_none() {
                     effective_audio_sample_text = models.default_audio_sample_text.clone();
@@ -383,7 +398,62 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
             }
         }
 
-        if let Some(audio_data) = effective_audio_sample {
+        if speaker_embedding.is_none() {
+            if let Some(audio_data) = effective_audio_sample {
+                let speaker_encoder = models
+                    .speaker_encoder
+                    .as_ref()
+                    .ok_or_else(|| ApiError::internal("Speaker encoder not loaded"))?;
+
+                // Decode reference audio to f32 samples
+                let (ref_samples, ref_sr) = match audio_data {
+                    AudioSampleData::Base64(b64) => {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(&b64)
+                            .map_err(|e| ApiError::bad_request(format!("Invalid base64: {e}")))?;
+                        validate_audio_sample_size(&state, bytes.len())?;
+                        qwen3_tts::audio::load_wav_bytes(&bytes)
+                            .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
+                    }
+                    AudioSampleData::Bytes(bytes) => {
+                        validate_audio_sample_size(&state, bytes.len())?;
+                        qwen3_tts::audio::load_wav_bytes(&bytes)
+                            .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
+                    }
+                };
+
+                // Resample to 24kHz for speaker encoder
+                let ref_samples_24k = if ref_sr != 24000 {
+                    qwen3_tts::audio::resample(&ref_samples, ref_sr, 24000)
+                        .map_err(|e| ApiError::internal(e.to_string()))?
+                } else {
+                    ref_samples
+                };
+
+                // Extract speaker embedding
+                speaker_embedding = Some(
+                    speaker_encoder
+                        .extract_embedding(&ref_samples_24k)
+                        .map_err(|e| ApiError::internal(e.to_string()))?,
+                );
+
+                if effective_audio_sample_text.is_some() {
+                    let audio_encoder = models.audio_encoder.as_ref().ok_or_else(|| {
+                        ApiError::internal(
+                            "Audio encoder not loaded for ICL mode. \
+                             Ensure speech_tokenizer/model.safetensors exists in the base model directory.",
+                        )
+                    })?;
+                    icl_ref_codes = Some(
+                        audio_encoder
+                            .encode(&ref_samples_24k)
+                            .map_err(|e| ApiError::internal(e.to_string()))?,
+                    );
+                }
+            }
+        }
+
+        if let Some(speaker_embedding) = speaker_embedding {
             // Voice cloning path
             let base_model = models.base_model.as_ref().ok_or_else(|| {
                 ApiError::bad_request(
@@ -391,54 +461,18 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                      Set TTS_BASE_MODEL_PATH to enable voice cloning.",
                 )
             })?;
-            let speaker_encoder = models.speaker_encoder.as_ref().ok_or_else(|| {
-                ApiError::internal("Speaker encoder not loaded")
-            })?;
-
-            // Decode reference audio to f32 samples
-            let (ref_samples, ref_sr) = match audio_data {
-                AudioSampleData::Base64(b64) => {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&b64)
-                        .map_err(|e| ApiError::bad_request(format!("Invalid base64: {e}")))?;
-                    validate_audio_sample_size(&state, bytes.len())?;
-                    qwen3_tts::audio::load_wav_bytes(&bytes)
-                        .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
-                }
-                AudioSampleData::Bytes(bytes) => {
-                    validate_audio_sample_size(&state, bytes.len())?;
-                    qwen3_tts::audio::load_wav_bytes(&bytes)
-                        .map_err(|e| ApiError::bad_request(format!("Invalid audio: {e}")))?
-                }
-            };
-
-            // Resample to 24kHz for speaker encoder
-            let ref_samples_24k = if ref_sr != 24000 {
-                qwen3_tts::audio::resample(&ref_samples, ref_sr, 24000)
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-            } else {
-                ref_samples
-            };
-
-            // Extract speaker embedding
-            let speaker_embedding = speaker_encoder
-                .extract_embedding(&ref_samples_24k)
-                .map_err(|e| ApiError::internal(e.to_string()))?;
 
             let mut merged_waveform = Vec::new();
             let mut merged_sample_rate = None;
 
             if let Some(icl_text) = effective_audio_sample_text.as_deref() {
-                // ICL mode: encode reference audio to codec tokens
-                let audio_encoder = models.audio_encoder.as_ref().ok_or_else(|| {
+                // ICL mode: use precomputed ref codes when available.
+                let ref_codes = icl_ref_codes.as_ref().ok_or_else(|| {
                     ApiError::internal(
                         "Audio encoder not loaded for ICL mode. \
                          Ensure speech_tokenizer/model.safetensors exists in the base model directory.",
                     )
                 })?;
-                let ref_codes = audio_encoder
-                    .encode(&ref_samples_24k)
-                    .map_err(|e| ApiError::internal(e.to_string()))?;
 
                 for (segment_idx, segment) in segments.iter().enumerate() {
                     ensure_task_not_cancelled(&state, task_id)?;
@@ -455,7 +489,7 @@ async fn generate_speech(state: AppState, params: SpeechParams) -> Result<Respon
                         .generate_with_icl(
                             segment,
                             icl_text,
-                            &ref_codes,
+                            ref_codes,
                             &speaker_embedding,
                             &language,
                             state.speech_runtime.generation_temperature,
@@ -692,7 +726,13 @@ fn split_text_for_tts(
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        split_block_for_tts(paragraph, max_bytes, max_chars, split_on_commas, &mut chunks);
+        split_block_for_tts(
+            paragraph,
+            max_bytes,
+            max_chars,
+            split_on_commas,
+            &mut chunks,
+        );
     }
 
     if chunks.is_empty() {
@@ -778,15 +818,7 @@ fn advance_within_budget(text: &str, start: usize, max_bytes: usize, max_chars: 
 fn is_preferred_boundary(ch: char, split_on_commas: bool) -> bool {
     matches!(
         ch,
-        '\n' | '\r'
-            | '。'
-            | '！'
-            | '？'
-            | '；'
-            | '.'
-            | '!'
-            | '?'
-            | ';'
+        '\n' | '\r' | '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'
     ) || (split_on_commas && matches!(ch, '，' | ',' | '、'))
 }
 
@@ -826,7 +858,9 @@ mod tests {
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
     }
 
     #[test]
@@ -835,7 +869,9 @@ mod tests {
         let chunks = split_text_for_tts(&input, TEST_MAX_BYTES, TEST_MAX_CHARS, false);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.len() <= TEST_MAX_BYTES));
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= TEST_MAX_CHARS));
     }
 
     #[test]

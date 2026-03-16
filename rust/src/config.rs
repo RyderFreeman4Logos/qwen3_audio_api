@@ -212,7 +212,9 @@ impl SpeechRuntimeConfig {
         let target_codes = self
             .segment_target_max_codes
             .clamp(self.min_generation_codes, self.max_generation_codes);
-        let available = target_codes.saturating_sub(self.base_generation_codes).max(1) as f32;
+        let available = target_codes
+            .saturating_sub(self.base_generation_codes)
+            .max(1) as f32;
         let estimated = (available / self.codes_per_char).floor() as usize;
         estimated.max(32)
     }
