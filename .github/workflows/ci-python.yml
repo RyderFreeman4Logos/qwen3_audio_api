@@ -27,18 +27,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --project python
 
-      - name: Cache models
-        id: cache-models
-        uses: actions/cache@v4
-        with:
-          path: |
-            models/Qwen3-TTS-12Hz-0.6B-CustomVoice
-            models/Qwen3-TTS-12Hz-0.6B-Base
-            models/Qwen3-ASR-0.6B
-          key: qwen-audio-models-0.6B-v2
-
       - name: Download models
-        if: steps.cache-models.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
           uv run --project python huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
