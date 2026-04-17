@@ -303,6 +303,8 @@ CONTENT_TYPES: dict[ResponseFormat, str] = {
     ResponseFormat.pcm: "audio/pcm",
 }
 
+TTS_SAMPLE_RATE = 24000
+
 
 def _encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
     buf = io.BytesIO()
@@ -319,6 +321,48 @@ def _encode_flac(audio: np.ndarray, sample_rate: int) -> bytes:
 def _encode_pcm(audio: np.ndarray) -> bytes:
     int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
     return int16.tobytes()
+
+
+def _decode_audio_sample(
+    audio_bytes: bytes, *, target_sr: int
+) -> tuple[np.ndarray, int]:
+    try:
+        audio_arr, audio_sr = sf.read(io.BytesIO(audio_bytes))
+    except sf.LibsndfileError as exc:
+        logger.info("audio decode fallback via ffmpeg (reason: %s)", exc)
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    "pipe:0",
+                    "-ar",
+                    str(target_sr),
+                    "-ac",
+                    "1",
+                    "-f",
+                    "wav",
+                    "pipe:1",
+                ],
+                input=audio_bytes,
+                capture_output=True,
+            )
+        except FileNotFoundError as ffmpeg_exc:
+            raise HTTPException(status_code=400, detail=str(ffmpeg_exc)) from ffmpeg_exc
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=stderr or "ffmpeg audio decode failed",
+            )
+
+        audio_arr, audio_sr = sf.read(io.BytesIO(result.stdout))
+
+    return audio_arr.astype(np.float32), int(audio_sr)
 
 
 def _encode_with_ffmpeg(
@@ -643,8 +687,7 @@ async def create_speech(raw_request: Request) -> Response:
         ref_audio: tuple[np.ndarray, int] | str | None = None
         if audio_upload is not None and hasattr(audio_upload, "read"):
             audio_bytes = await audio_upload.read()
-            audio_arr, audio_sr = sf.read(io.BytesIO(audio_bytes))
-            ref_audio = (audio_arr.astype(np.float32), int(audio_sr))
+            ref_audio = _decode_audio_sample(audio_bytes, target_sr=TTS_SAMPLE_RATE)
         elif audio_upload is not None:
             ref_audio = str(audio_upload)
     else:
