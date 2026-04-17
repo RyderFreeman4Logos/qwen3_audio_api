@@ -446,23 +446,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.model = None
     if model_path:
+        model_path = os.path.abspath(model_path)
+        old_cwd = os.getcwd()
+        os.chdir(model_path)
         logger.info(
-            "Loading custom-voice model %s on %s (%s, attn=%s)",
+            "Loading custom-voice model from %s on %s (%s, attn=%s)",
             model_path, device, dtype_name, attn_impl,
         )
-        app.state.model = Qwen3TTSModel.from_pretrained(model_path, **kwargs)
-        logger.info("Custom-voice model loaded successfully")
+        try:
+            app.state.model = Qwen3TTSModel.from_pretrained(".", **kwargs)
+            logger.info("Custom-voice model loaded successfully")
+        finally:
+            os.chdir(old_cwd)
 
     app.state.base_model = None
     if base_model_path:
+        base_model_path = os.path.abspath(base_model_path)
+        old_cwd = os.getcwd()
+        os.chdir(base_model_path)
         logger.info(
-            "Loading base model %s on %s (%s, attn=%s)",
+            "Loading base model from %s on %s (%s, attn=%s)",
             base_model_path, device, dtype_name, attn_impl,
         )
-        app.state.base_model = Qwen3TTSModel.from_pretrained(
-            base_model_path, **kwargs
-        )
-        logger.info("Base model loaded successfully")
+        try:
+            app.state.base_model = Qwen3TTSModel.from_pretrained(".", **kwargs)
+            logger.info("Base model loaded successfully")
+        finally:
+            os.chdir(old_cwd)
 
     app.state.asr_model = None
     if asr_model_path:
