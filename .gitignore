@@ -14,9 +14,11 @@ wheels/
 
 # Models
 models/
+python/qwen3-base-model
 
 # Rust build output
 rust/target/
+rust/vendor/
 
 # IDE / OS
 .DS_Store
