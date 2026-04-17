@@ -418,9 +418,12 @@ def _decode_audio_sample(
                 ],
                 input=audio_bytes,
                 capture_output=True,
+                timeout=30,
             )
         except FileNotFoundError as ffmpeg_exc:
             raise HTTPException(status_code=400, detail=str(ffmpeg_exc)) from ffmpeg_exc
+        except subprocess.TimeoutExpired as ffmpeg_exc:
+            raise HTTPException(status_code=400, detail="ffmpeg timeout") from ffmpeg_exc
 
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
@@ -451,23 +454,27 @@ def _encode_with_ffmpeg(
         ResponseFormat.aac: ("aac", "adts"),
     }
     codec, container = codec_map[fmt]
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-acodec",
-            codec,
-            "-f",
-            container,
-            "pipe:1",
-        ],
-        input=wav_bytes,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-acodec",
+                codec,
+                "-f",
+                container,
+                "pipe:1",
+            ],
+            input=wav_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as ffmpeg_exc:
+        raise HTTPException(status_code=400, detail="ffmpeg timeout") from ffmpeg_exc
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
         raise HTTPException(status_code=500, detail=f"ffmpeg encoding failed: {stderr}")
@@ -516,19 +523,15 @@ def resolve_voice(voice: str) -> str:
 # ---------------------------------------------------------------------------
 
 _inference_lock = threading.Lock()
-_inference_semaphore: threading.Semaphore | None = None
 _task_control = SpeechTaskControl()
 _runtime_config: SpeechRuntimeConfig | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _inference_semaphore, _runtime_config
+    global _runtime_config
 
     _runtime_config = SpeechRuntimeConfig()
-    _inference_semaphore = threading.Semaphore(
-        _runtime_config.max_concurrent_speech_requests
-    )
 
     model_path = os.environ.get("TTS_CUSTOMVOICE_MODEL_PATH", "")
     base_model_path = os.environ.get("TTS_BASE_MODEL_PATH", "")
@@ -816,25 +819,25 @@ async def _synthesize_audio_segments(
     emitted_audio = False
 
     try:
-        with _inference_lock:
-            for idx, segment in enumerate(plan.segments):
-                if raw_request is not None and await raw_request.is_disconnected():
-                    _task_control.cancel_task(plan.task_id)
+        for idx, segment in enumerate(plan.segments):
+            if raw_request is not None and await raw_request.is_disconnected():
+                _task_control.cancel_task(plan.task_id)
 
-                if _task_control.is_cancelled(plan.task_id):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"speech task {plan.task_id} was cancelled",
-                    )
-
-                logger.info(
-                    "speech task %d segment %d/%d: chars=%d",
-                    plan.task_id,
-                    idx + 1,
-                    len(plan.segments),
-                    len(segment),
+            if _task_control.is_cancelled(plan.task_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"speech task {plan.task_id} was cancelled",
                 )
 
+            logger.info(
+                "speech task %d segment %d/%d: chars=%d",
+                plan.task_id,
+                idx + 1,
+                len(plan.segments),
+                len(segment),
+            )
+
+            with _inference_lock:
                 audio, sr = _generate_segment(
                     plan.model,
                     segment,
@@ -846,16 +849,16 @@ async def _synthesize_audio_segments(
                     speaker=plan.speaker,
                     instruct=plan.instruct,
                 )
-                chunk = audio.astype(np.float32)
+            chunk = audio.astype(np.float32)
 
-                if emitted_audio:
-                    gap_samples = int(sr * _runtime_config.segment_gap_seconds)
-                    gap = np.zeros(gap_samples, dtype=np.float32)
-                    chunk = np.concatenate((gap, chunk))
+            if emitted_audio:
+                gap_samples = int(sr * _runtime_config.segment_gap_seconds)
+                gap = np.zeros(gap_samples, dtype=np.float32)
+                chunk = np.concatenate((gap, chunk))
 
-                emitted_audio = True
-                _task_control.set_completed_segments(plan.task_id, idx + 1)
-                yield chunk, sr
+            emitted_audio = True
+            _task_control.set_completed_segments(plan.task_id, idx + 1)
+            yield chunk, sr
     except asyncio.CancelledError:
         _task_control.cancel_task(plan.task_id)
         raise
@@ -1003,25 +1006,32 @@ def convert_audio_to_wav(audio_bytes: bytes, suffix: str = ".mp3") -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
         wav_path = wav_file.name
 
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            src_path,
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-sample_fmt",
-            "s16",
-            wav_path,
-        ],
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                src_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                wav_path,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as ffmpeg_exc:
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
+        os.unlink(src_path)
+        raise HTTPException(status_code=400, detail="ffmpeg timeout") from ffmpeg_exc
     os.unlink(src_path)
     if result.returncode != 0:
         if os.path.exists(wav_path):
