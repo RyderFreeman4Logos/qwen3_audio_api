@@ -9,92 +9,38 @@ A high-performance Rust server that wraps [Qwen3-TTS](https://github.com/QwenLM/
 
 The release binaries are self-contained — ffmpeg is statically linked for audio format conversion (MP3, Opus, AAC, FLAC encoding and decoding of all common audio input formats). No external ffmpeg installation is required.
 
-## Quick start with pre-built binaries
+## Quick Start
 
-Pre-built binaries are available from [GitHub Releases](https://github.com/second-state/qwen3_audio_api/releases).
-
-### Linux (x86_64)
+Run the installer to download the binary, models, and tokenizers for your platform:
 
 ```bash
-# Download and extract
-curl -LO https://github.com/second-state/qwen3_audio_api/releases/latest/download/qwen3-audio-api-linux-x86_64.tar.gz
-tar xzf qwen3-audio-api-linux-x86_64.tar.gz
-cd qwen3-audio-api-linux-x86_64
+curl -sSf https://raw.githubusercontent.com/second-state/qwen3_audio_api/main/rust/install.sh | bash
+```
 
-# Set libtorch library path (bundled in the archive)
-export LD_LIBRARY_PATH=$(pwd)/libtorch/lib:$LD_LIBRARY_PATH
+The installer detects your OS, CPU, and NVIDIA GPU (if present), then sets up everything in `./qwen3_audio_api/`. Once complete, start the server:
 
-# Download models (see "Download models" section below)
-# ...
-
-# Run the server with TTS + ASR
-TTS_CUSTOMVOICE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  TTS_BASE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-Base \
-  ASR_MODEL_PATH=/path/to/models/Qwen3-ASR-0.6B \
+```bash
+cd qwen3_audio_api
+TTS_CUSTOMVOICE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  TTS_BASE_MODEL_PATH=./models/Qwen3-TTS-12Hz-0.6B-Base \
+  ASR_MODEL_PATH=./models/Qwen3-ASR-0.6B \
   ./qwen3-audio-api
 ```
 
-### macOS (Apple Silicon)
+Text-to-Speech:
 
 ```bash
-# Download and extract
-curl -LO https://github.com/second-state/qwen3_audio_api/releases/latest/download/qwen3-audio-api-macos-arm64.tar.gz
-tar xzf qwen3-audio-api-macos-arm64.tar.gz
-cd qwen3-audio-api-macos-arm64
-
-# Download models (see "Download models" section below)
-# ...
-
-# Run the server with TTS + ASR
-# mlx.metallib is included next to the binary — no extra setup needed
-TTS_CUSTOMVOICE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  TTS_BASE_MODEL_PATH=/path/to/models/Qwen3-TTS-12Hz-0.6B-Base \
-  ASR_MODEL_PATH=/path/to/models/Qwen3-ASR-0.6B \
-  ./qwen3-audio-api
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3-tts", "input": "Hello world!", "voice": "alloy"}' \
+  --output speech.mp3
 ```
 
-## Download models
-
-Download model weights before starting the server. At least one of the three model paths must be set.
-
-| Model | Parameters | Type | Use case |
-|-------|-----------|------|----------|
-| `Qwen3-TTS-12Hz-0.6B-CustomVoice` | 0.6B | CustomVoice | Built-in voice presets via `voice` parameter |
-| `Qwen3-TTS-12Hz-0.6B-Base` | 0.6B | Base | Voice cloning via `audio_sample` parameter |
-| `Qwen3-ASR-0.6B` | 0.6B | ASR | Speech-to-text transcription |
+Speech-to-Text:
 
 ```bash
-pip install huggingface_hub transformers
-mkdir -p models
-
-# CustomVoice TTS
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  --local-dir ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice
-
-# Base TTS (voice cloning)
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --local-dir ./models/Qwen3-TTS-12Hz-0.6B-Base
-
-# ASR
-huggingface-cli download Qwen/Qwen3-ASR-0.6B \
-  --local-dir ./models/Qwen3-ASR-0.6B
-```
-
-### Generate tokenizer.json
-
-The Rust tokenizer crate requires `tokenizer.json` files that are not included in the HuggingFace model downloads. Generate them with:
-
-```bash
-python3 -c "
-from transformers import AutoTokenizer
-import os
-for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qwen3-ASR-0.6B']:
-    path = f'models/{model}'
-    if os.path.isdir(path):
-        tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-        tok.backend_tokenizer.save(f'{path}/tokenizer.json')
-        print(f'Generated {path}/tokenizer.json')
-"
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F file=@audio.wav -F model=qwen3-asr
 ```
 
 ## Configuration
@@ -300,43 +246,125 @@ The `voice` field accepts OpenAI voice names (mapped to Qwen3-TTS speakers) or Q
 
 All formats are handled natively by the statically-linked ffmpeg library. No external tools are needed.
 
-## Building from source
+## Build from Source
 
-ffmpeg is built from source and statically linked by default (via the `build-ffmpeg` feature). You do **not** need ffmpeg installed.
+### Prerequisites
 
-### Linux (libtorch backend)
+Install Python tools for downloading models and generating tokenizer files:
 
 ```bash
-# Install build dependencies
-sudo apt-get install -y cmake pkg-config nasm libclang-dev libmp3lame-dev libopus-dev
+pip install huggingface_hub transformers
+```
 
-# Download libtorch (CPU)
-wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcpu.zip" -O libtorch.zip
-unzip -q libtorch.zip && rm libtorch.zip
-export LIBTORCH=$(pwd)/libtorch
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+#### Download models
 
-# For CUDA 12.8 instead, download:
-# wget -q "https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcu128.zip" -O libtorch.zip
+Download model weights before starting the server. At least one of the three model paths must be set.
 
-# Build (ffmpeg is compiled from source and statically linked)
-cd rust
-cargo build --release
+| Model | Parameters | Type | Use case |
+|-------|-----------|------|----------|
+| `Qwen3-TTS-12Hz-0.6B-CustomVoice` | 0.6B | CustomVoice | Built-in voice presets via `voice` parameter |
+| `Qwen3-TTS-12Hz-0.6B-Base` | 0.6B | Base | Voice cloning via `audio_sample` parameter |
+| `Qwen3-ASR-0.6B` | 0.6B | ASR | Speech-to-text transcription |
+
+```bash
+mkdir -p models
+
+# CustomVoice TTS
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --local-dir ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+# Base TTS (voice cloning)
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --local-dir ./models/Qwen3-TTS-12Hz-0.6B-Base
+
+# ASR
+huggingface-cli download Qwen/Qwen3-ASR-0.6B \
+  --local-dir ./models/Qwen3-ASR-0.6B
+```
+
+#### Generate tokenizer.json
+
+The Rust `tokenizers` crate requires a `tokenizer.json` file with the full tokenizer configuration. Generate it from the Python tokenizer for each model you downloaded:
+
+```bash
+python3 -c "
+from transformers import AutoTokenizer
+for model in ['Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen3-TTS-12Hz-0.6B-Base', 'Qwen3-ASR-0.6B']:
+    path = f'models/{model}'
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    tok.backend_tokenizer.save(f'{path}/tokenizer.json')
+    print(f'Saved {path}/tokenizer.json')
+"
+```
+
+### Build for macOS (MLX)
+
+Requires Apple Silicon Mac, Xcode (full installation for Metal shader compiler), and CMake.
+
+Install dependencies:
+
+```bash
+brew install cmake pkg-config nasm lame opus
+```
+
+Build:
+
+```bash
+git clone https://github.com/second-state/qwen3_audio_api.git
+cd qwen3_audio_api/rust
+cargo build --release --no-default-features --features "mlx build-ffmpeg"
+```
+
+Copy `mlx.metallib` next to the binary:
+
+```bash
+cp target/release/build/qwen3_tts-*/out/lib/mlx.metallib target/release/
 # Binary at: target/release/qwen3-audio-api
 ```
 
-### macOS Apple Silicon (MLX backend)
+### Build for Linux (libtorch)
+
+#### Download libtorch
+
+Download and extract libtorch for your platform from [libtorch-releases](https://github.com/second-state/libtorch-releases/releases/tag/v2.7.1):
 
 ```bash
-# Install build dependencies
-brew install cmake lame opus
+# Linux x86_64 (CPU)
+curl -LO https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-x86_64-2.7.1.tar.gz
+tar xzf libtorch-cxx11-abi-x86_64-2.7.1.tar.gz
 
-# Build with MLX (ffmpeg is compiled from source and statically linked)
-cd rust
-cargo build --release --no-default-features --features "mlx build-ffmpeg"
+# Linux x86_64 (CUDA 12.6)
+curl -LO https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-x86_64-cuda12.6-2.7.1.tar.gz
+tar xzf libtorch-cxx11-abi-x86_64-cuda12.6-2.7.1.tar.gz
 
-# Copy mlx.metallib next to the binary for redistribution
-cp target/release/build/qwen3_tts-*/out/lib/mlx.metallib target/release/
+# Linux aarch64 (CPU)
+curl -LO https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-2.7.1.tar.gz
+tar xzf libtorch-cxx11-abi-aarch64-2.7.1.tar.gz
+
+# Linux aarch64 (CUDA 12.6 / Jetson)
+curl -LO https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-cuda12.6-2.7.1.tar.gz
+tar xzf libtorch-cxx11-abi-aarch64-cuda12.6-2.7.1.tar.gz
+```
+
+#### Set environment variables
+
+```bash
+export LIBTORCH=$(pwd)/libtorch
+export LIBTORCH_BYPASS_VERSION_CHECK=1
+```
+
+#### Install dependencies
+
+```bash
+sudo apt-get install -y cmake pkg-config nasm libclang-dev libmp3lame-dev libopus-dev
+```
+
+#### Build
+
+```bash
+git clone https://github.com/second-state/qwen3_audio_api.git
+cd qwen3_audio_api/rust
+cargo build --release
 # Binary at: target/release/qwen3-audio-api
 ```
 

@@ -10,7 +10,6 @@ jobs:
     timeout-minutes: 120
 
     env:
-      LIBTORCH_VERSION: "2.7.0"
       LIBTORCH_BYPASS_VERSION_CHECK: "1"
 
     steps:
@@ -24,34 +23,20 @@ jobs:
           sudo apt-get update && sudo apt-get install -y cmake pkg-config \
             nasm libclang-dev libmp3lame-dev libopus-dev
 
-      - name: Cache libtorch
-        id: cache-libtorch
-        uses: actions/cache@v4
-        with:
-          path: libtorch
-          key: libtorch-cpu-${{ env.LIBTORCH_VERSION }}
-
       - name: Download libtorch
-        if: steps.cache-libtorch.outputs.cache-hit != 'true'
         run: |
-          wget -q "https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip" -O libtorch.zip
-          unzip -q libtorch.zip
-          rm libtorch.zip
+          curl -Lo libtorch.tar.gz "https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-x86_64-2.7.1.tar.gz"
+          tar xzf libtorch.tar.gz
+          rm libtorch.tar.gz
 
       - name: Set libtorch environment
         run: |
           echo "LIBTORCH=$(pwd)/libtorch" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$(pwd)/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
+      - name: Force latest qwen3_tts and qwen3_asr from HEAD
+        working-directory: rust
+        run: rm Cargo.lock
 
       - name: Build Rust server
         working-directory: rust
@@ -64,18 +49,7 @@ jobs:
       - name: Install Python deps (for model download)
         run: uv sync --project python
 
-      - name: Cache models
-        id: cache-models
-        uses: actions/cache@v4
-        with:
-          path: |
-            models/Qwen3-TTS-12Hz-0.6B-CustomVoice
-            models/Qwen3-TTS-12Hz-0.6B-Base
-            models/Qwen3-ASR-0.6B
-          key: qwen-audio-models-0.6B-v2
-
       - name: Download models
-        if: steps.cache-models.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
           uv run --project python huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
