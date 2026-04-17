@@ -5,22 +5,25 @@ progress tracking, and task cancellation — matching the Rust API surface
 so the existing Rust client works without changes.
 """
 
+import asyncio
 import io
 import logging
 import math
 import os
+import struct
 import subprocess
 import tempfile
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator
+from typing import AsyncGenerator, AsyncIterator
 
 import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_asr import Qwen3ASRModel
 from qwen_tts import Qwen3TTSModel
@@ -80,9 +83,38 @@ class SpeechRequest(BaseModel):
     audio_sample_text: str | None = None
 
 
+@dataclass(slots=True)
+class ParsedSpeechRequest:
+    input_text: str
+    voice: str
+    response_format: ResponseFormat
+    speed: float
+    language: str
+    instructions: str | None
+    audio_sample_text: str | None
+    ref_audio: tuple[np.ndarray, int] | str | None
+
+
+@dataclass(slots=True)
+class SpeechSynthesisPlan:
+    task_id: int
+    segments: list[str]
+    speed: float
+    response_format: ResponseFormat
+    model: Qwen3TTSModel
+    is_voice_clone: bool
+    language: str
+    ref_audio: object = None
+    ref_text: str | None = None
+    use_icl: bool = False
+    speaker: str = ""
+    instruct: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Runtime configuration (matches Rust env vars)
 # ---------------------------------------------------------------------------
+
 
 def _env_int(name: str, default: int) -> int:
     val = os.environ.get(name, "")
@@ -151,9 +183,7 @@ _COMMA_BOUNDARIES = frozenset("，,、")
 
 
 def _is_preferred_boundary(ch: str, split_on_commas: bool) -> bool:
-    return ch in _SENTENCE_BOUNDARIES or (
-        split_on_commas and ch in _COMMA_BOUNDARIES
-    )
+    return ch in _SENTENCE_BOUNDARIES or (split_on_commas and ch in _COMMA_BOUNDARIES)
 
 
 def split_text_for_tts(
@@ -229,6 +259,7 @@ def _split_block(
 # Task control (cancellation + progress)
 # ---------------------------------------------------------------------------
 
+
 class SpeechTaskControl:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -274,6 +305,13 @@ class SpeechTaskControl:
             self._cancelled_up_to = max(self._cancelled_up_to, tid)
             return tid
 
+    def cancel_task(self, task_id: int) -> bool:
+        with self._lock:
+            if self._current_id != task_id:
+                return False
+            self._cancelled_up_to = max(self._cancelled_up_to, task_id)
+            return True
+
     def cancel_all(self) -> int:
         with self._lock:
             max_id = self._next_id - 1
@@ -304,12 +342,43 @@ CONTENT_TYPES: dict[ResponseFormat, str] = {
 }
 
 TTS_SAMPLE_RATE = 24000
+WAV_BITS_PER_SAMPLE = 16
+WAV_STREAMING_DATA_SIZE = 0xFFFFFFFF
+
+
+def _audio_channels(audio: np.ndarray) -> int:
+    return 1 if audio.ndim == 1 else int(audio.shape[1])
+
+
+def _wav_header(sample_rate: int, channels: int, data_size: int) -> bytes:
+    block_align = channels * (WAV_BITS_PER_SAMPLE // 8)
+    byte_rate = sample_rate * block_align
+    riff_size = (
+        WAV_STREAMING_DATA_SIZE
+        if data_size == WAV_STREAMING_DATA_SIZE
+        else 36 + data_size
+    )
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size & 0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        WAV_BITS_PER_SAMPLE,
+        b"data",
+        data_size & 0xFFFFFFFF,
+    )
 
 
 def _encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
-    buf = io.BytesIO()
-    sf.write(buf, audio, sample_rate, format="WAV")
-    return buf.getvalue()
+    pcm = _encode_pcm(audio)
+    return _wav_header(sample_rate, _audio_channels(audio), len(pcm)) + pcm
 
 
 def _encode_flac(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -360,7 +429,12 @@ def _decode_audio_sample(
                 detail=stderr or "ffmpeg audio decode failed",
             )
 
-        audio_arr, audio_sr = sf.read(io.BytesIO(result.stdout))
+        try:
+            audio_arr, audio_sr = sf.read(io.BytesIO(result.stdout))
+        except sf.LibsndfileError as transcode_exc:
+            raise HTTPException(
+                status_code=400, detail=str(transcode_exc)
+            ) from transcode_exc
 
     return audio_arr.astype(np.float32), int(audio_sr)
 
@@ -396,15 +470,11 @@ def _encode_with_ffmpeg(
     )
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
-        raise HTTPException(
-            status_code=500, detail=f"ffmpeg encoding failed: {stderr}"
-        )
+        raise HTTPException(status_code=500, detail=f"ffmpeg encoding failed: {stderr}")
     return result.stdout
 
 
-def encode_audio(
-    audio: np.ndarray, sample_rate: int, fmt: ResponseFormat
-) -> bytes:
+def encode_audio(audio: np.ndarray, sample_rate: int, fmt: ResponseFormat) -> bytes:
     if fmt == ResponseFormat.wav:
         return _encode_wav(audio, sample_rate)
     if fmt == ResponseFormat.flac:
@@ -495,7 +565,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         os.chdir(model_path)
         logger.info(
             "Loading custom-voice model from %s on %s (%s, attn=%s)",
-            model_path, device, dtype_name, attn_impl,
+            model_path,
+            device,
+            dtype_name,
+            attn_impl,
         )
         try:
             app.state.model = Qwen3TTSModel.from_pretrained(".", **kwargs)
@@ -510,7 +583,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         os.chdir(base_model_path)
         logger.info(
             "Loading base model from %s on %s (%s, attn=%s)",
-            base_model_path, device, dtype_name, attn_impl,
+            base_model_path,
+            device,
+            dtype_name,
+            attn_impl,
         )
         try:
             app.state.base_model = Qwen3TTSModel.from_pretrained(".", **kwargs)
@@ -522,7 +598,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if asr_model_path:
         logger.info(
             "Loading ASR model %s on %s (%s, attn=%s)",
-            asr_model_path, device, dtype_name, attn_impl,
+            asr_model_path,
+            device,
+            dtype_name,
+            attn_impl,
         )
         asr_kwargs: dict[str, object] = {
             "device_map": device,
@@ -562,6 +641,7 @@ app = FastAPI(
 # Speech generation with segmentation
 # ---------------------------------------------------------------------------
 
+
 def _generate_segment(
     model: Qwen3TTSModel,
     text: str,
@@ -593,71 +673,7 @@ def _generate_segment(
     return wavs[0], sr
 
 
-def _synthesize_with_segments(
-    model: Qwen3TTSModel,
-    segments: list[str],
-    task_id: int,
-    *,
-    is_voice_clone: bool,
-    language: str,
-    ref_audio: object = None,
-    ref_text: str | None = None,
-    use_icl: bool = False,
-    speaker: str = "",
-    instruct: str = "",
-    gap_seconds: float = 0.12,
-) -> tuple[np.ndarray, int]:
-    """Generate speech segment-by-segment, merging with silence gaps."""
-    assert _runtime_config is not None
-    merged: list[np.ndarray] = []
-    sample_rate = 24000
-
-    for idx, segment in enumerate(segments):
-        if _task_control.is_cancelled(task_id):
-            raise HTTPException(
-                status_code=400,
-                detail=f"speech task {task_id} was cancelled",
-            )
-
-        logger.info(
-            "speech task %d segment %d/%d: chars=%d",
-            task_id, idx + 1, len(segments), len(segment),
-        )
-
-        audio, sr = _generate_segment(
-            model,
-            segment,
-            is_voice_clone=is_voice_clone,
-            language=language,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            use_icl=use_icl,
-            speaker=speaker,
-            instruct=instruct,
-        )
-        sample_rate = sr
-
-        if merged:
-            gap_samples = int(sr * gap_seconds)
-            merged.append(np.zeros(gap_samples, dtype=np.float32))
-        merged.append(audio.astype(np.float32))
-
-        _task_control.set_completed_segments(task_id, idx + 1)
-
-    if not merged:
-        return np.zeros(sample_rate * 2, dtype=np.float32), sample_rate
-
-    return np.concatenate(merged), sample_rate
-
-
-@app.post("/v1/audio/speech")
-async def create_speech(raw_request: Request) -> Response:
-    """Generate audio from text (OpenAI-compatible).
-
-    Accepts JSON or multipart/form-data. Automatically segments long text.
-    """
-    assert _runtime_config is not None
-
+async def _parse_speech_request(raw_request: Request) -> ParsedSpeechRequest:
     req_content_type = raw_request.headers.get("content-type", "")
 
     if "multipart/form-data" in req_content_type:
@@ -704,7 +720,6 @@ async def create_speech(raw_request: Request) -> Response:
     if not input_text.strip():
         raise HTTPException(status_code=422, detail="'input' field is required")
 
-    # Load default reference audio if none provided
     default_ref_path = os.environ.get("DEFAULT_AUDIO_SAMPLE_PATH", "")
     default_ref_text = os.environ.get("DEFAULT_AUDIO_SAMPLE_TEXT", "")
     if ref_audio is None and default_ref_path and os.path.isfile(default_ref_path):
@@ -712,9 +727,23 @@ async def create_speech(raw_request: Request) -> Response:
         if not audio_sample_text and default_ref_text:
             audio_sample_text = default_ref_text
 
-    # Segment input text
+    return ParsedSpeechRequest(
+        input_text=input_text,
+        voice=voice,
+        response_format=fmt,
+        speed=speed,
+        language=language,
+        instructions=instructions,
+        audio_sample_text=audio_sample_text,
+        ref_audio=ref_audio,
+    )
+
+
+def _prepare_speech_plan(request: ParsedSpeechRequest) -> SpeechSynthesisPlan:
+    assert _runtime_config is not None
+
     segments = split_text_for_tts(
-        input_text,
+        request.input_text,
         _runtime_config.segment_max_bytes,
         _runtime_config.segment_max_chars(),
         _runtime_config.segment_break_on_commas,
@@ -722,14 +751,15 @@ async def create_speech(raw_request: Request) -> Response:
 
     task_id = _task_control.alloc_task_id()
     _task_control.set_current(task_id, len(segments))
-
-    logger.info(
-        "speech task %d accepted: input_chars=%d, segments=%d",
-        task_id, len(input_text), len(segments),
-    )
-
     try:
-        if ref_audio is not None:
+        logger.info(
+            "speech task %d accepted: input_chars=%d, segments=%d",
+            task_id,
+            len(request.input_text),
+            len(segments),
+        )
+
+        if request.ref_audio is not None:
             base_model: Qwen3TTSModel | None = app.state.base_model
             if base_model is None:
                 raise HTTPException(
@@ -739,81 +769,215 @@ async def create_speech(raw_request: Request) -> Response:
                         "Set TTS_BASE_MODEL_PATH to enable voice cloning."
                     ),
                 )
-            use_icl = audio_sample_text is not None
-            with _inference_lock:
-                audio, sr = _synthesize_with_segments(
-                    base_model,
-                    segments,
-                    task_id,
-                    is_voice_clone=True,
-                    language=language,
-                    ref_audio=ref_audio,
-                    ref_text=audio_sample_text,
-                    use_icl=use_icl,
-                    gap_seconds=_runtime_config.segment_gap_seconds,
-                )
-        else:
-            model: Qwen3TTSModel | None = app.state.model
-            if model is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Custom-voice model is not loaded. "
-                        "Set TTS_CUSTOMVOICE_MODEL_PATH to enable speaker voices, "
-                        "or provide audio_sample to use voice cloning."
-                    ),
-                )
-            speaker = resolve_voice(voice)
-            instruct = instructions or ""
-            with _inference_lock:
-                audio, sr = _synthesize_with_segments(
-                    model,
-                    segments,
-                    task_id,
-                    is_voice_clone=False,
-                    language=language,
-                    speaker=speaker,
-                    instruct=instruct,
-                    gap_seconds=_runtime_config.segment_gap_seconds,
+            return SpeechSynthesisPlan(
+                task_id=task_id,
+                segments=segments,
+                speed=request.speed,
+                response_format=request.response_format,
+                model=base_model,
+                is_voice_clone=True,
+                language=request.language,
+                ref_audio=request.ref_audio,
+                ref_text=request.audio_sample_text,
+                use_icl=request.audio_sample_text is not None,
+            )
+
+        model: Qwen3TTSModel | None = app.state.model
+        if model is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Custom-voice model is not loaded. "
+                    "Set TTS_CUSTOMVOICE_MODEL_PATH to enable speaker voices, "
+                    "or provide audio_sample to use voice cloning."
+                ),
+            )
+        return SpeechSynthesisPlan(
+            task_id=task_id,
+            segments=segments,
+            speed=request.speed,
+            response_format=request.response_format,
+            model=model,
+            is_voice_clone=False,
+            language=request.language,
+            speaker=resolve_voice(request.voice),
+            instruct=request.instructions or "",
+        )
+    except Exception:
+        _task_control.clear_current(task_id)
+        raise
+
+
+async def _synthesize_audio_segments(
+    plan: SpeechSynthesisPlan,
+    raw_request: Request | None = None,
+) -> AsyncIterator[tuple[np.ndarray, int]]:
+    assert _runtime_config is not None
+    emitted_audio = False
+
+    try:
+        with _inference_lock:
+            for idx, segment in enumerate(plan.segments):
+                if raw_request is not None and await raw_request.is_disconnected():
+                    _task_control.cancel_task(plan.task_id)
+
+                if _task_control.is_cancelled(plan.task_id):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"speech task {plan.task_id} was cancelled",
+                    )
+
+                logger.info(
+                    "speech task %d segment %d/%d: chars=%d",
+                    plan.task_id,
+                    idx + 1,
+                    len(plan.segments),
+                    len(segment),
                 )
 
-        audio = apply_speed(audio, speed)
-        data = encode_audio(audio, sr, fmt)
-        return Response(content=data, media_type=CONTENT_TYPES[fmt])
+                audio, sr = _generate_segment(
+                    plan.model,
+                    segment,
+                    is_voice_clone=plan.is_voice_clone,
+                    language=plan.language,
+                    ref_audio=plan.ref_audio,
+                    ref_text=plan.ref_text,
+                    use_icl=plan.use_icl,
+                    speaker=plan.speaker,
+                    instruct=plan.instruct,
+                )
+                chunk = audio.astype(np.float32)
+
+                if emitted_audio:
+                    gap_samples = int(sr * _runtime_config.segment_gap_seconds)
+                    gap = np.zeros(gap_samples, dtype=np.float32)
+                    chunk = np.concatenate((gap, chunk))
+
+                emitted_audio = True
+                _task_control.set_completed_segments(plan.task_id, idx + 1)
+                yield chunk, sr
+    except asyncio.CancelledError:
+        _task_control.cancel_task(plan.task_id)
+        raise
     finally:
-        _task_control.clear_current(task_id)
+        _task_control.clear_current(plan.task_id)
+
+
+async def _collect_synthesized_audio(
+    plan: SpeechSynthesisPlan,
+    raw_request: Request | None = None,
+) -> tuple[np.ndarray, int]:
+    sample_rate = TTS_SAMPLE_RATE
+    merged: list[np.ndarray] = []
+
+    async for chunk, sr in _synthesize_audio_segments(plan, raw_request):
+        sample_rate = sr
+        merged.append(chunk)
+
+    if not merged:
+        return np.zeros(sample_rate * 2, dtype=np.float32), sample_rate
+
+    return np.concatenate(merged), sample_rate
+
+
+async def _stream_pcm_segments(
+    plan: SpeechSynthesisPlan,
+    raw_request: Request,
+) -> AsyncGenerator[tuple[bytes, int, int], None]:
+    async for chunk, sr in _synthesize_audio_segments(plan, raw_request):
+        if plan.speed != 1.0:
+            chunk = apply_speed(chunk, plan.speed)
+        yield _encode_pcm(chunk), sr, _audio_channels(chunk)
+
+
+@app.post("/v1/audio/speech")
+async def create_speech(raw_request: Request) -> Response:
+    """Generate audio from text (OpenAI-compatible).
+
+    Accepts JSON or multipart/form-data. Automatically segments long text.
+    """
+    request = await _parse_speech_request(raw_request)
+    plan = _prepare_speech_plan(request)
+    audio, sr = await _collect_synthesized_audio(plan, raw_request)
+    audio = apply_speed(audio, plan.speed)
+    data = encode_audio(audio, sr, plan.response_format)
+    return Response(content=data, media_type=CONTENT_TYPES[plan.response_format])
+
+
+@app.post("/v1/audio/speech/stream")
+async def create_streaming_speech(raw_request: Request) -> StreamingResponse:
+    """Generate streaming WAV audio from text (OpenAI-compatible)."""
+    request = await _parse_speech_request(raw_request)
+    plan = _prepare_speech_plan(request)
+    pcm_stream = _stream_pcm_segments(plan, raw_request)
+    sample_rate = TTS_SAMPLE_RATE
+    channels = 1
+    first_chunk = b""
+
+    try:
+        first_chunk, sample_rate, channels = await anext(pcm_stream)
+    except StopAsyncIteration:
+        pass
+    except Exception:
+        await pcm_stream.aclose()
+        raise
+
+    async def stream_chunks() -> AsyncGenerator[bytes, None]:
+        try:
+            yield _wav_header(sample_rate, channels, WAV_STREAMING_DATA_SIZE)
+            if first_chunk:
+                yield first_chunk
+            async for chunk, _, _ in pcm_stream:
+                if chunk:
+                    yield chunk
+        except asyncio.CancelledError:
+            _task_control.cancel_task(plan.task_id)
+            raise
+        finally:
+            await pcm_stream.aclose()
+
+    return StreamingResponse(
+        stream_chunks(),
+        media_type="audio/wav",
+        headers={"Transfer-Encoding": "chunked"},
+    )
 
 
 # ---------------------------------------------------------------------------
 # Cancel / status endpoints (Rust-client compatible)
 # ---------------------------------------------------------------------------
 
+
 @app.post("/v1/audio/speech/cancel-current")
 async def cancel_current() -> JSONResponse:
     tid = _task_control.cancel_current()
-    return JSONResponse({
-        "ok": True,
-        "message": (
-            f"Cancellation requested for current speech task {tid}"
-            if tid
-            else "No running speech task to cancel"
-        ),
-        "current_task_id": _task_control.status()["current_task_id"],
-        "cancelled_up_to_task_id": tid or 0,
-    })
+    return JSONResponse(
+        {
+            "ok": True,
+            "message": (
+                f"Cancellation requested for current speech task {tid}"
+                if tid
+                else "No running speech task to cancel"
+            ),
+            "current_task_id": _task_control.status()["current_task_id"],
+            "cancelled_up_to_task_id": tid or 0,
+        }
+    )
 
 
 @app.post("/v1/audio/speech/cancel-all")
 async def cancel_all() -> JSONResponse:
     cancelled_up_to = _task_control.cancel_all()
-    return JSONResponse({
-        "ok": True,
-        "message": (
-            f"Cancellation requested for all speech tasks up to {cancelled_up_to}"
-        ),
-        "current_task_id": _task_control.status()["current_task_id"],
-        "cancelled_up_to_task_id": cancelled_up_to,
-    })
+    return JSONResponse(
+        {
+            "ok": True,
+            "message": (
+                f"Cancellation requested for all speech tasks up to {cancelled_up_to}"
+            ),
+            "current_task_id": _task_control.status()["current_task_id"],
+            "cancelled_up_to_task_id": cancelled_up_to,
+        }
+    )
 
 
 @app.get("/v1/audio/speech/status")
@@ -824,6 +988,7 @@ async def speech_status() -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
+
 
 def convert_audio_to_wav(audio_bytes: bytes, suffix: str = ".mp3") -> str:
     if suffix.lower() == ".wav":
@@ -840,8 +1005,19 @@ def convert_audio_to_wav(audio_bytes: bytes, suffix: str = ".mp3") -> str:
 
     result = subprocess.run(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", src_path, "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            src_path,
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
             wav_path,
         ],
         capture_output=True,
