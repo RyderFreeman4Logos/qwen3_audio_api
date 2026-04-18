@@ -527,11 +527,40 @@ _task_control = SpeechTaskControl()
 _runtime_config: SpeechRuntimeConfig | None = None
 
 
+def _patch_vocoder_chunk_size() -> None:
+    """Honor RUST_TTS_VOCODER_CHUNK / QWEN_TTS_VOCODER_CHUNK on the 12Hz
+    tokenizer's chunked_decode (default is 300). Smaller chunk = more
+    left-context overlap = slower; larger = fewer forward calls but more
+    memory per call."""
+    raw = os.environ.get("QWEN_TTS_VOCODER_CHUNK") or os.environ.get(
+        "RUST_TTS_VOCODER_CHUNK"
+    )
+    if not raw:
+        return
+    try:
+        chunk_size = int(raw)
+    except ValueError:
+        logger.warning("invalid vocoder chunk size: %r", raw)
+        return
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2Decoder,
+    )
+
+    original = Qwen3TTSTokenizerV2Decoder.chunked_decode
+
+    def patched(self, codes, chunk_size=chunk_size, left_context_size=25):  # type: ignore[override]
+        return original(self, codes, chunk_size, left_context_size)
+
+    Qwen3TTSTokenizerV2Decoder.chunked_decode = patched
+    logger.info("Patched vocoder chunked_decode chunk_size=%d", chunk_size)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _runtime_config
 
     _runtime_config = SpeechRuntimeConfig()
+    _patch_vocoder_chunk_size()
 
     model_path = os.environ.get("TTS_CUSTOMVOICE_MODEL_PATH", "")
     base_model_path = os.environ.get("TTS_BASE_MODEL_PATH", "")
@@ -596,6 +625,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Base model loaded successfully")
         finally:
             os.chdir(old_cwd)
+
+    # Optional torch.compile for base/custom models. Off by default because
+    # the first forward pays a multi-minute compile, and dynamic shapes can
+    # trigger recompiles. Enable with QWEN_TTS_COMPILE=1 once you've
+    # verified the workload is stable.
+    compile_flag = os.environ.get("QWEN_TTS_COMPILE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    compile_mode = os.environ.get("QWEN_TTS_COMPILE_MODE", "default")
+    if compile_flag:
+        # Qwen3TTSModel is a plain wrapper around a HF `nn.Module` exposed as
+        # `.model`. Compile the inner module so the wrapper's python-side
+        # logic (generate_*, voice clone) still runs uncompiled.
+        for name in ("model", "base_model"):
+            wrapper = getattr(app.state, name, None)
+            inner = getattr(wrapper, "model", None) if wrapper else None
+            if inner is None:
+                continue
+            try:
+                logger.info(
+                    "Compiling %s.model with torch.compile(mode=%s, dynamic=True)",
+                    name,
+                    compile_mode,
+                )
+                wrapper.model = torch.compile(
+                    inner, mode=compile_mode, dynamic=True
+                )
+                logger.info("%s.model compiled", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("torch.compile on %s.model failed: %s", name, exc)
 
     app.state.asr_model = None
     if asr_model_path:
