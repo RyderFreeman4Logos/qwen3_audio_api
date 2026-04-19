@@ -16,9 +16,13 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.14.14",
+    "pytest>=8.3.4",
 ]
 
 [tool.uv]
 override-dependencies = [
     "transformers==4.57.6",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
