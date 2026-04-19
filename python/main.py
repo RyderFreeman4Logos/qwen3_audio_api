@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import blake2s
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import AsyncGenerator, AsyncIterator
 
 import numpy as np
@@ -120,6 +120,14 @@ class VoiceArtifacts:
     normalized_ref_audio: tuple[np.ndarray, int]
     ref_code: torch.Tensor
     ref_spk_embedding: torch.Tensor
+
+
+@dataclass(slots=True)
+class DefaultVoiceClonePrompt:
+    ref_audio: str
+    ref_text: str | None
+    use_icl: bool
+    voice_clone_prompt: list[VoiceClonePromptItem]
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +723,154 @@ def _patch_vocoder_chunk_size() -> None:
     logger.info("Patched vocoder chunked_decode chunk_size=%d", chunk_size)
 
 
+def _resolve_cuda_device_index(device: str) -> int:
+    try:
+        cuda_device = torch.device(device)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError(f"Unsupported QWEN_TTS_DEVICE: {device!r}") from exc
+
+    if cuda_device.type != "cuda":
+        raise ValueError(f"QWEN_TTS_DEVICE must resolve to CUDA, got {device!r}")
+
+    if cuda_device.index is not None:
+        return int(cuda_device.index)
+
+    return int(torch.cuda.current_device())
+
+
+def _apply_cuda_vram_fraction(device: str) -> None:
+    raw = os.environ.get("QWEN_TTS_VRAM_FRACTION", "").strip()
+    if not raw:
+        return
+
+    try:
+        fraction = float(raw)
+    except ValueError:
+        logger.warning(
+            "QWEN_TTS_VRAM_FRACTION=%r not a float, ignored",
+            raw,
+        )
+        return
+
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(
+            f"QWEN_TTS_VRAM_FRACTION must be in (0,1], got {fraction}"
+        )
+
+    if not torch.cuda.is_available():
+        logger.warning(
+            "QWEN_TTS_VRAM_FRACTION is set but CUDA is unavailable; ignoring"
+        )
+        return
+
+    device_index = _resolve_cuda_device_index(device)
+    torch.cuda.set_per_process_memory_fraction(fraction, device_index)
+    total = torch.cuda.get_device_properties(device_index).total_memory
+    logger.info(
+        "VRAM fraction cap: %.2f (%.0f MiB of %.0f MiB total)",
+        fraction,
+        total * fraction / 1024 / 1024,
+        total / 1024 / 1024,
+    )
+
+
+def _precompute_default_voice_clone_prompt(
+    model: Qwen3TTSModel | None,
+) -> DefaultVoiceClonePrompt | None:
+    default_ref_path = os.environ.get("DEFAULT_AUDIO_SAMPLE_PATH", "").strip()
+    if not default_ref_path:
+        return None
+
+    if model is None:
+        logger.warning(
+            "DEFAULT_AUDIO_SAMPLE_PATH is set, but the base model is unavailable; "
+            "skipping default voice-clone precompute"
+        )
+        return None
+
+    if not os.path.isfile(default_ref_path):
+        logger.warning(
+            "DEFAULT_AUDIO_SAMPLE_PATH=%s is not a file; skipping default "
+            "voice-clone precompute",
+            default_ref_path,
+        )
+        return None
+
+    default_ref_text = os.environ.get("DEFAULT_AUDIO_SAMPLE_TEXT", "").strip() or None
+    use_icl = default_ref_text is not None
+    if use_icl:
+        logger.info("Default voice cloning will run in ICL mode")
+    else:
+        logger.warning(
+            "DEFAULT_AUDIO_SAMPLE_TEXT is not set; default voice cloning will "
+            "use x-vector mode"
+        )
+
+    prompt = _prepare_voice_clone_prompt(
+        model,
+        ref_audio=default_ref_path,
+        ref_text=default_ref_text,
+        use_icl=use_icl,
+    )
+    logger.info("Precomputed default voice-clone prompt")
+    return DefaultVoiceClonePrompt(
+        ref_audio=default_ref_path,
+        ref_text=default_ref_text,
+        use_icl=use_icl,
+        voice_clone_prompt=prompt,
+    )
+
+
+def _vram_warmup_enabled() -> bool:
+    return _env_bool("QWEN_TTS_VRAM_WARMUP", False)
+
+
+async def _run_vram_warmup(
+    default_voice_clone: DefaultVoiceClonePrompt,
+    *,
+    model: Qwen3TTSModel,
+    device: str,
+) -> None:
+    assert _runtime_config is not None
+
+    if not torch.cuda.is_available():
+        logger.warning("QWEN_TTS_VRAM_WARMUP=1 but CUDA is unavailable; skipping")
+        return
+
+    device_index = _resolve_cuda_device_index(device)
+    dummy_text = "测试" * max(32, _runtime_config.segment_max_chars() // 2)
+    task_id = _task_control.alloc_task_id()
+    plan = SpeechSynthesisPlan(
+        task_id=task_id,
+        segments=[dummy_text],
+        speed=1.0,
+        response_format=ResponseFormat.wav,
+        model=model,
+        is_voice_clone=True,
+        language="Chinese",
+        ref_audio=default_voice_clone.ref_audio,
+        ref_text=default_voice_clone.ref_text,
+        use_icl=default_voice_clone.use_icl,
+        voice_clone_prompt=default_voice_clone.voice_clone_prompt,
+    )
+
+    started_at = monotonic()
+    torch.cuda.reset_peak_memory_stats(device_index)
+    _task_control.set_current(task_id, len(plan.segments))
+    try:
+        async for _chunk, _sr in _synthesize_audio_segments(plan):
+            pass
+    finally:
+        _task_control.clear_current(task_id)
+
+    peak_mib = torch.cuda.max_memory_allocated(device_index) / 1024 / 1024
+    logger.info(
+        "VRAM warmup-lock: wall=%.2fs peak=%.0f MiB",
+        monotonic() - started_at,
+        peak_mib,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _runtime_config
@@ -736,6 +892,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     dtype_name = os.environ.get("QWEN_TTS_DTYPE", "bfloat16")
     dtype = getattr(torch, dtype_name, torch.bfloat16)
     attn_impl = os.environ.get("QWEN_TTS_ATTN", "flash_attention_2")
+    _apply_cuda_vram_fraction(device)
 
     if not model_path and not base_model_path and not asr_model_path:
         raise RuntimeError(
@@ -885,6 +1042,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             asr_model_path, **asr_kwargs
         )
         logger.info("ASR model loaded successfully")
+
+    base_model: Qwen3TTSModel | None = app.state.base_model
+    default_voice_clone = _precompute_default_voice_clone_prompt(base_model)
+    if _vram_warmup_enabled():
+        if default_voice_clone is None or base_model is None:
+            raise RuntimeError(
+                "QWEN_TTS_VRAM_WARMUP=1 requires DEFAULT_AUDIO_SAMPLE_PATH and "
+                "TTS_BASE_MODEL_PATH so the default voice-clone prompt can be "
+                "precomputed."
+            )
+        await _run_vram_warmup(
+            default_voice_clone,
+            model=base_model,
+            device=device,
+        )
 
     logger.info(
         "Runtime config: segment_max_bytes=%d, segment_max_chars=%d, "
