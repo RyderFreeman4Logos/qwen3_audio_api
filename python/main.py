@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -120,6 +121,12 @@ class VoiceArtifacts:
     normalized_ref_audio: tuple[np.ndarray, int]
     ref_code: torch.Tensor
     ref_spk_embedding: torch.Tensor
+
+
+@dataclass(slots=True)
+class SegmentTalkerResult:
+    codes_for_decode: torch.Tensor
+    ref_code_length: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +543,16 @@ def resolve_voice(voice: str) -> str:
 # ---------------------------------------------------------------------------
 
 _inference_lock = threading.Lock()
+_talker_lock = threading.Lock()
+_vocoder_lock = threading.Lock()
 _task_control = SpeechTaskControl()
 _runtime_config: SpeechRuntimeConfig | None = None
 _voice_artifact_cache: OrderedDict[str, VoiceArtifacts] = OrderedDict()
 _voice_artifact_cache_lock = threading.Lock()
+_segment_pipeline_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="qwen3-segment-pipeline",
+)
 
 
 def _voice_cache_capacity() -> int:
@@ -950,6 +963,104 @@ def _generate_segment(
     return wavs[0], sr
 
 
+def _generate_segment_talker_result(
+    plan: SpeechSynthesisPlan,
+    text: str,
+) -> SegmentTalkerResult:
+    """Generate codec tokens for one segment without running the vocoder yet."""
+    model = plan.model
+
+    if plan.is_voice_clone:
+        if plan.voice_clone_prompt is None:
+            raise ValueError("voice_clone_prompt must be prepared before pipelining")
+
+        prompt_items = plan.voice_clone_prompt
+        prompt_item = prompt_items[0]
+        voice_clone_prompt = model._prompt_items_to_voice_clone_prompt(prompt_items)
+        input_ids = model._tokenize_texts([model._build_assistant_text(text)])
+
+        ref_ids: list[torch.Tensor | None] | None = None
+        if prompt_item.ref_text:
+            ref_ids = [
+                model._tokenize_texts([model._build_ref_text(prompt_item.ref_text)])[0]
+            ]
+
+        gen_kwargs = model._merge_generate_kwargs()
+        with _talker_lock:
+            talker_codes_list, _ = model.model.generate(
+                input_ids=input_ids,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_clone_prompt,
+                languages=[plan.language],
+                non_streaming_mode=False,
+                **gen_kwargs,
+            )
+
+        codes = talker_codes_list[0]
+        ref_code_length = 0
+        if prompt_item.ref_code is not None:
+            ref_code = prompt_item.ref_code.to(codes.device)
+            ref_code_length = int(ref_code.shape[0])
+            codes = torch.cat([ref_code, codes], dim=0)
+        return SegmentTalkerResult(
+            codes_for_decode=codes,
+            ref_code_length=ref_code_length,
+        )
+
+    input_ids = model._tokenize_texts([model._build_assistant_text(text)])
+    instruct_ids: list[torch.Tensor | None] = []
+    if plan.instruct:
+        instruct_ids.append(
+            model._tokenize_texts([model._build_instruct_text(plan.instruct)])[0]
+        )
+    else:
+        instruct_ids.append(None)
+
+    gen_kwargs = model._merge_generate_kwargs()
+    with _talker_lock:
+        talker_codes_list, _ = model.model.generate(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=[plan.language],
+            speakers=[plan.speaker],
+            non_streaming_mode=True,
+            **gen_kwargs,
+        )
+
+    return SegmentTalkerResult(codes_for_decode=talker_codes_list[0])
+
+
+def _decode_segment_audio(
+    model: Qwen3TTSModel,
+    talker_result: SegmentTalkerResult,
+) -> tuple[np.ndarray, int]:
+    """Decode codec tokens into waveform, matching the upstream wrapper behavior."""
+    with _vocoder_lock:
+        wavs, sample_rate = model.model.speech_tokenizer.decode(
+            [{"audio_codes": talker_result.codes_for_decode}]
+        )
+
+    wav = wavs[0]
+    if talker_result.ref_code_length > 0:
+        total_len = int(talker_result.codes_for_decode.shape[0])
+        cut = int(
+            talker_result.ref_code_length / max(total_len, 1) * wav.shape[0]
+        )
+        wav = wav[cut:]
+    return wav, sample_rate
+
+
+def _submit_segment_talker_result(
+    plan: SpeechSynthesisPlan,
+    text: str,
+) -> Future[SegmentTalkerResult]:
+    return _segment_pipeline_executor.submit(
+        _generate_segment_talker_result,
+        plan,
+        text,
+    )
+
+
 async def _parse_speech_request(raw_request: Request) -> ParsedSpeechRequest:
     req_content_type = raw_request.headers.get("content-type", "")
 
@@ -1091,6 +1202,7 @@ async def _synthesize_audio_segments(
 ) -> AsyncIterator[tuple[np.ndarray, int]]:
     assert _runtime_config is not None
     emitted_audio = False
+    pending_talker_result: Future[SegmentTalkerResult] | None = None
 
     try:
         if plan.is_voice_clone and plan.voice_clone_prompt is None:
@@ -1101,7 +1213,7 @@ async def _synthesize_audio_segments(
                     status_code=400,
                     detail=f"speech task {plan.task_id} was cancelled",
                 )
-            with _inference_lock:
+            with _talker_lock:
                 plan.voice_clone_prompt = _prepare_voice_clone_prompt(
                     plan.model,
                     ref_audio=plan.ref_audio,
@@ -1127,19 +1239,20 @@ async def _synthesize_audio_segments(
                 len(segment),
             )
 
-            with _inference_lock:
-                audio, sr = _generate_segment(
-                    plan.model,
-                    segment,
-                    is_voice_clone=plan.is_voice_clone,
-                    language=plan.language,
-                    voice_clone_prompt=plan.voice_clone_prompt,
-                    ref_audio=plan.ref_audio,
-                    ref_text=plan.ref_text,
-                    use_icl=plan.use_icl,
-                    speaker=plan.speaker,
-                    instruct=plan.instruct,
+            if pending_talker_result is None:
+                talker_result = _generate_segment_talker_result(plan, segment)
+            else:
+                talker_result = await asyncio.wrap_future(pending_talker_result)
+                pending_talker_result = None
+
+            next_idx = idx + 1
+            if next_idx < len(plan.segments):
+                pending_talker_result = _submit_segment_talker_result(
+                    plan,
+                    plan.segments[next_idx],
                 )
+
+            audio, sr = _decode_segment_audio(plan.model, talker_result)
             chunk = audio.astype(np.float32)
 
             if emitted_audio:
