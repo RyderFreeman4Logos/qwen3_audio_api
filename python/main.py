@@ -8,15 +8,17 @@ so the existing Rust client works without changes.
 import asyncio
 import io
 import logging
-import math
 import os
 import struct
 import subprocess
 import tempfile
 import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import blake2s
+from time import perf_counter
 from typing import AsyncGenerator, AsyncIterator
 
 import numpy as np
@@ -27,6 +29,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_asr import Qwen3ASRModel
 from qwen_tts import Qwen3TTSModel
+from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +110,16 @@ class SpeechSynthesisPlan:
     ref_audio: object = None
     ref_text: str | None = None
     use_icl: bool = False
+    voice_clone_prompt: list[VoiceClonePromptItem] | None = None
     speaker: str = ""
     instruct: str = ""
+
+
+@dataclass(slots=True)
+class VoiceArtifacts:
+    normalized_ref_audio: tuple[np.ndarray, int]
+    ref_code: torch.Tensor
+    ref_spk_embedding: torch.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +434,9 @@ def _decode_audio_sample(
         except FileNotFoundError as ffmpeg_exc:
             raise HTTPException(status_code=400, detail=str(ffmpeg_exc)) from ffmpeg_exc
         except subprocess.TimeoutExpired as ffmpeg_exc:
-            raise HTTPException(status_code=400, detail="ffmpeg timeout") from ffmpeg_exc
+            raise HTTPException(
+                status_code=400, detail="ffmpeg timeout"
+            ) from ffmpeg_exc
 
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
@@ -525,6 +538,181 @@ def resolve_voice(voice: str) -> str:
 _inference_lock = threading.Lock()
 _task_control = SpeechTaskControl()
 _runtime_config: SpeechRuntimeConfig | None = None
+_voice_artifact_cache: OrderedDict[str, VoiceArtifacts] = OrderedDict()
+_voice_artifact_cache_lock = threading.Lock()
+
+
+def _voice_cache_capacity() -> int:
+    return max(_env_int("QWEN_TTS_VOICE_CACHE_SIZE", 8), 1)
+
+
+def _clear_voice_artifact_cache() -> None:
+    with _voice_artifact_cache_lock:
+        _voice_artifact_cache.clear()
+
+
+def _voice_artifact_cache_keys_for_tests() -> list[str]:
+    with _voice_artifact_cache_lock:
+        return list(_voice_artifact_cache.keys())
+
+
+def _serialize_voice_cache_input(ref_audio: object) -> bytes:
+    if (
+        isinstance(ref_audio, tuple)
+        and len(ref_audio) == 2
+        and isinstance(ref_audio[0], np.ndarray)
+    ):
+        audio = np.ascontiguousarray(ref_audio[0].astype(np.float32, copy=False))
+        sample_rate = int(ref_audio[1])
+        header = (
+            f"ndarray:{sample_rate}:{audio.dtype.str}:{audio.ndim}:{audio.shape}"
+        ).encode("utf-8")
+        return header + b"\0" + audio.tobytes()
+
+    if isinstance(ref_audio, str):
+        if os.path.isfile(ref_audio):
+            with open(ref_audio, "rb") as fh:
+                return b"file\0" + fh.read()
+        return b"string\0" + ref_audio.encode("utf-8")
+
+    raise TypeError(f"Unsupported voice-clone reference audio: {type(ref_audio)!r}")
+
+
+def _voice_artifact_cache_key(
+    ref_audio: object,
+    *,
+    ref_text: str | None,
+    use_icl: bool,
+) -> str:
+    hasher = blake2s()
+    hasher.update(_serialize_voice_cache_input(ref_audio))
+    hasher.update(b"\0")
+    hasher.update(b"icl=1" if use_icl else b"icl=0")
+    hasher.update(b"\0")
+    hasher.update((ref_text or "").encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _compute_voice_artifacts(
+    model: Qwen3TTSModel,
+    ref_audio: object,
+) -> VoiceArtifacts:
+    prompt_item = model.create_voice_clone_prompt(
+        ref_audio=ref_audio,
+        ref_text="__voice_artifact_cache__",
+        x_vector_only_mode=False,
+    )[0]
+    normalized_ref_audio = model._normalize_audio_inputs(ref_audio)[0]
+    return VoiceArtifacts(
+        normalized_ref_audio=normalized_ref_audio,
+        ref_code=prompt_item.ref_code,
+        ref_spk_embedding=prompt_item.ref_spk_embedding,
+    )
+
+
+def _build_voice_clone_prompt(
+    artifacts: VoiceArtifacts,
+    *,
+    ref_text: str | None,
+    use_icl: bool,
+) -> list[VoiceClonePromptItem]:
+    if use_icl and not ref_text:
+        raise ValueError("ref_text is required when use_icl=True")
+
+    return [
+        VoiceClonePromptItem(
+            ref_code=artifacts.ref_code if use_icl else None,
+            ref_spk_embedding=artifacts.ref_spk_embedding,
+            x_vector_only_mode=not use_icl,
+            icl_mode=use_icl,
+            ref_text=ref_text if use_icl else None,
+        )
+    ]
+
+
+def _prepare_voice_clone_prompt(
+    model: Qwen3TTSModel,
+    *,
+    ref_audio: object,
+    ref_text: str | None,
+    use_icl: bool,
+) -> list[VoiceClonePromptItem]:
+    cache_key = _voice_artifact_cache_key(
+        ref_audio,
+        ref_text=ref_text,
+        use_icl=use_icl,
+    )
+    with _voice_artifact_cache_lock:
+        cached = _voice_artifact_cache.get(cache_key)
+        if cached is not None:
+            _voice_artifact_cache.move_to_end(cache_key)
+            logger.info(
+                "voice_artifact_cache hit speaker=%s compute_ms=0.00",
+                cache_key[:16],
+            )
+            return _build_voice_clone_prompt(
+                cached,
+                ref_text=ref_text,
+                use_icl=use_icl,
+            )
+
+    started_at = perf_counter()
+    artifacts = _compute_voice_artifacts(model, ref_audio)
+    compute_ms = (perf_counter() - started_at) * 1000
+
+    with _voice_artifact_cache_lock:
+        cached = _voice_artifact_cache.get(cache_key)
+        if cached is None:
+            _voice_artifact_cache[cache_key] = artifacts
+            _voice_artifact_cache.move_to_end(cache_key)
+            while len(_voice_artifact_cache) > _voice_cache_capacity():
+                _voice_artifact_cache.popitem(last=False)
+            cached = artifacts
+            logger.info(
+                "voice_artifact_cache miss speaker=%s compute_ms=%.2f",
+                cache_key[:16],
+                compute_ms,
+            )
+        else:
+            _voice_artifact_cache.move_to_end(cache_key)
+            logger.info(
+                "voice_artifact_cache hit speaker=%s compute_ms=0.00",
+                cache_key[:16],
+            )
+
+    return _build_voice_clone_prompt(
+        cached,
+        ref_text=ref_text,
+        use_icl=use_icl,
+    )
+
+
+def _patch_vocoder_chunk_size() -> None:
+    """Honor RUST_TTS_VOCODER_CHUNK / QWEN_TTS_VOCODER_CHUNK on the 12Hz
+    tokenizer's chunked_decode (default is 300). Smaller chunk = more
+    left-context overlap = slower; larger = fewer forward calls but more
+    memory per call."""
+    raw = os.environ.get("QWEN_TTS_VOCODER_CHUNK") or os.environ.get(
+        "RUST_TTS_VOCODER_CHUNK"
+    )
+    if not raw:
+        return
+    try:
+        chunk_size = int(raw)
+    except ValueError:
+        logger.warning("invalid vocoder chunk size: %r", raw)
+        return
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2Decoder,
+    )
+
+    original = Qwen3TTSTokenizerV2Decoder.chunked_decode
+
+    def patched(self, codes, chunk_size=chunk_size, left_context_size=25):  # type: ignore[override]
+        return original(self, codes, chunk_size, left_context_size)
+
+    Qwen3TTSTokenizerV2Decoder.chunked_decode = patched
+    logger.info("Patched vocoder chunked_decode chunk_size=%d", chunk_size)
 
 
 @asynccontextmanager
@@ -532,6 +720,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _runtime_config
 
     _runtime_config = SpeechRuntimeConfig()
+    _patch_vocoder_chunk_size()
+    _clear_voice_artifact_cache()
+    app.state.voice_artifact_cache = _voice_artifact_cache
+    app.state.voice_artifact_cache_lock = _voice_artifact_cache_lock
+    logger.info(
+        "Voice artifact cache enabled: capacity=%d",
+        _voice_cache_capacity(),
+    )
 
     model_path = os.environ.get("TTS_CUSTOMVOICE_MODEL_PATH", "")
     base_model_path = os.environ.get("TTS_BASE_MODEL_PATH", "")
@@ -597,6 +793,77 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         finally:
             os.chdir(old_cwd)
 
+    # Optional torch.compile for base/custom models. Off by default because
+    # the first forward pays a multi-minute compile, and dynamic shapes can
+    # trigger recompiles. Enable with QWEN_TTS_COMPILE=1 once you've
+    # verified the workload is stable.
+    compile_flag = os.environ.get("QWEN_TTS_COMPILE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    compile_mode = os.environ.get("QWEN_TTS_COMPILE_MODE", "default")
+    if compile_flag:
+        # HF generation enters `Qwen3TTSForConditionalGeneration.talker.generate()`
+        # and then repeatedly calls the deep transformer backbones on
+        # `talker.model` and `talker.code_predictor.model`. Compiling the outer
+        # wrapper is too shallow because GenerationMixin bypasses it via direct
+        # attribute access on these inner modules.
+        def _resolve_attr_path(root: object, attr_path: str) -> object | None:
+            node = root
+            for attr in attr_path.split("."):
+                node = getattr(node, attr, None)
+                if node is None:
+                    return None
+            return node
+
+        def _compile_attr_path(root: object, root_name: str, attr_path: str) -> bool:
+            parent_path, attr_name = attr_path.rsplit(".", 1)
+            parent = _resolve_attr_path(root, parent_path)
+            target = getattr(parent, attr_name, None) if parent else None
+            full_path = f"{root_name}.{attr_path}"
+            if target is None:
+                logger.info(
+                    "Skipping torch.compile for %s: attribute path not found",
+                    full_path,
+                )
+                return False
+            try:
+                logger.info(
+                    "Compiling %s with torch.compile(mode=%s, dynamic=True)",
+                    full_path,
+                    compile_mode,
+                )
+                setattr(
+                    parent,
+                    attr_name,
+                    torch.compile(target, mode=compile_mode, dynamic=True),
+                )
+                logger.info("%s compiled", full_path)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("torch.compile on %s failed: %s", full_path, exc)
+                return False
+
+        compiled_attr_paths = (
+            "model.talker.model",
+            "model.talker.code_predictor.model",
+        )
+        for name in ("model", "base_model"):
+            wrapper = getattr(app.state, name, None)
+            if wrapper is None:
+                continue
+            compiled_any = False
+            for attr_path in compiled_attr_paths:
+                compiled_any = (
+                    _compile_attr_path(wrapper, name, attr_path) or compiled_any
+                )
+            if not compiled_any:
+                logger.warning(
+                    "QWEN_TTS_COMPILE=1 but no deep backbone was compiled for %s",
+                    name,
+                )
+
     app.state.asr_model = None
     if asr_model_path:
         logger.info(
@@ -651,6 +918,7 @@ def _generate_segment(
     *,
     is_voice_clone: bool,
     language: str,
+    voice_clone_prompt: list[VoiceClonePromptItem] | None = None,
     ref_audio: object = None,
     ref_text: str | None = None,
     use_icl: bool = False,
@@ -659,13 +927,19 @@ def _generate_segment(
 ) -> tuple[np.ndarray, int]:
     """Generate speech for a single text segment."""
     if is_voice_clone:
-        wavs, sr = model.generate_voice_clone(
-            text=text,
-            language=language,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            x_vector_only_mode=not use_icl,
-        )
+        generate_kwargs: dict[str, object] = {
+            "text": text,
+            "language": language,
+        }
+        if voice_clone_prompt is not None:
+            generate_kwargs["voice_clone_prompt"] = voice_clone_prompt
+        else:
+            generate_kwargs.update(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=not use_icl,
+            )
+        wavs, sr = model.generate_voice_clone(**generate_kwargs)
     else:
         wavs, sr = model.generate_custom_voice(
             text=text,
@@ -819,6 +1093,22 @@ async def _synthesize_audio_segments(
     emitted_audio = False
 
     try:
+        if plan.is_voice_clone and plan.voice_clone_prompt is None:
+            if raw_request is not None and await raw_request.is_disconnected():
+                _task_control.cancel_task(plan.task_id)
+            if _task_control.is_cancelled(plan.task_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"speech task {plan.task_id} was cancelled",
+                )
+            with _inference_lock:
+                plan.voice_clone_prompt = _prepare_voice_clone_prompt(
+                    plan.model,
+                    ref_audio=plan.ref_audio,
+                    ref_text=plan.ref_text,
+                    use_icl=plan.use_icl,
+                )
+
         for idx, segment in enumerate(plan.segments):
             if raw_request is not None and await raw_request.is_disconnected():
                 _task_control.cancel_task(plan.task_id)
@@ -843,6 +1133,7 @@ async def _synthesize_audio_segments(
                     segment,
                     is_voice_clone=plan.is_voice_clone,
                     language=plan.language,
+                    voice_clone_prompt=plan.voice_clone_prompt,
                     ref_audio=plan.ref_audio,
                     ref_text=plan.ref_text,
                     use_icl=plan.use_icl,
