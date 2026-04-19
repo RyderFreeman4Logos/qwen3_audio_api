@@ -9,6 +9,7 @@ import asyncio
 import io
 import logging
 import os
+from pathlib import Path
 import struct
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from hashlib import blake2s
 from time import perf_counter
 from typing import AsyncGenerator, AsyncIterator
 
+from cublaslt_bootstrap import configure_cublaslt_tuning_env
 import numpy as np
 import soundfile as sf
 import torch
@@ -715,6 +717,88 @@ def _patch_vocoder_chunk_size() -> None:
     logger.info("Patched vocoder chunked_decode chunk_size=%d", chunk_size)
 
 
+def _cublaslt_tuning_cache_stats() -> tuple[Path, bool, int]:
+    cache_path = configure_cublaslt_tuning_env()
+    exists = cache_path.is_file()
+    size = cache_path.stat().st_size if exists else 0
+    return cache_path, exists, size
+
+
+def _configure_cuda_math_backends() -> None:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    preferred_linalg_library = getattr(
+        torch.backends.cuda,
+        "preferred_linalg_library",
+        None,
+    )
+    if preferred_linalg_library is None:
+        return
+
+    try:
+        preferred_linalg_library("cusolver")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("preferred_linalg_library('cusolver') unavailable: %s", exc)
+
+
+def _warmup_cublaslt_tuning(app: FastAPI, *, device: str) -> None:
+    if not torch.cuda.is_available():
+        logger.info("Skipping cuBLASLt warmup: CUDA unavailable")
+        return
+    if device.lower() == "cpu":
+        logger.info("Skipping cuBLASLt warmup: device=%s", device)
+        return
+
+    model: Qwen3TTSModel | None = getattr(app.state, "model", None)
+    warmup_kwargs: dict[str, object]
+    warmup_mode = "custom-voice"
+    if model is not None:
+        warmup_kwargs = {
+            "is_voice_clone": False,
+            "language": "Auto",
+            "speaker": resolve_voice("alloy"),
+            "instruct": "",
+        }
+    else:
+        model = getattr(app.state, "base_model", None)
+        default_ref_path = os.environ.get("DEFAULT_AUDIO_SAMPLE_PATH", "")
+        if model is None or not (default_ref_path and os.path.isfile(default_ref_path)):
+            logger.info("Skipping cuBLASLt warmup: no eligible TTS model loaded")
+            return
+
+        default_ref_text = os.environ.get("DEFAULT_AUDIO_SAMPLE_TEXT", "") or None
+        warmup_mode = "base-voice-clone"
+        warmup_kwargs = {
+            "is_voice_clone": True,
+            "language": "Auto",
+            "ref_audio": default_ref_path,
+            "ref_text": default_ref_text,
+            "use_icl": default_ref_text is not None,
+        }
+
+    started_at = perf_counter()
+    try:
+        _generate_segment(
+            model,
+            "Warm up.",
+            **warmup_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cuBLASLt warmup forward failed for %s: %s", warmup_mode, exc)
+        return
+
+    wall_ms = (perf_counter() - started_at) * 1000
+    cache_path, exists, size = _cublaslt_tuning_cache_stats()
+    logger.info(
+        "cuBLASLt warmup forward: mode=%s wall_ms=%.2f cache_exists=%s cache_size=%d",
+        warmup_mode,
+        wall_ms,
+        exists,
+        size,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _runtime_config
@@ -885,6 +969,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             asr_model_path, **asr_kwargs
         )
         logger.info("ASR model loaded successfully")
+
+    _configure_cuda_math_backends()
+    cache_path, cache_exists, cache_size = _cublaslt_tuning_cache_stats()
+    logger.info(
+        "cuBLASLt tuning cache: %s (exists=%s, size=%d)",
+        cache_path,
+        cache_exists,
+        cache_size,
+    )
+    _warmup_cublaslt_tuning(app, device=device)
 
     logger.info(
         "Runtime config: segment_max_bytes=%d, segment_max_chars=%d, "
