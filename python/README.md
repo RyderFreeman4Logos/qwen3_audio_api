@@ -262,7 +262,7 @@ The `voice` field accepts OpenAI voice names (mapped to Qwen3-TTS speakers) or Q
 
 ## Preparing reference audio
 
-The `audio_sample` parameter accepts a path to a WAV file. If your source audio is in another format (mp3, m4a, ogg, etc.), convert it with ffmpeg first:
+The `audio_sample` parameter accepts any audio format that `libsndfile` (WAV, FLAC, OGG/Vorbis, AIFF) or `ffmpeg` (MP3, M4A, AAC, WebM, Opus, and more) can decode — the server transcodes non-WAV inputs internally via an ffmpeg fallback. You can also preprocess locally to reduce upload size or request latency:
 
 ```bash
 ffmpeg -i input.m4a -ac 1 -ar 24000 -sample_fmt s16 reference.wav
